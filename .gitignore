@@ -1,0 +1,11 @@
+.env
+.env.local
+.DS_Store
+.vscode/
+.idea/
+*.log
+tmp/
+
+# Claude Code local-only files (machine-specific paths, per-user permissions)
+.claude/settings.local.json
+.claude/worktrees/

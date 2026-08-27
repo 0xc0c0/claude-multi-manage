@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# cmm - claude-multi-manage
+# Start and manage multiple `claude` sessions on one host via tmux.
+
+set -euo pipefail
+
+VERSION="0.2.0"
+PROG="$(basename "${0}")"
+SESSION_PREFIX="claude-"
+
+# ---------- helpers ----------
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# Resolve the real path to this script (used by `install`).
+_self_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ $src != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && printf '%s/%s\n' "$(pwd)" "$(basename "$src")"
+}
+
+_human_age() {
+  local now then secs
+  now=$(date +%s); then=$1; secs=$(( now - then ))
+  if   (( secs <    60 )); then printf '%ds ago' "$secs"
+  elif (( secs <  3600 )); then printf '%dm ago' $(( secs /    60 ))
+  elif (( secs < 86400 )); then printf '%dh ago' $(( secs /  3600 ))
+  else                          printf '%dd ago' $(( secs / 86400 ))
+  fi
+}
+
+# Print "NAME<TAB>PATH<TAB>ATTACHED<TAB>CREATED_EPOCH" for matching sessions.
+# scope = "here" (under $PWD) or "all".
+_collect_sessions() {
+  local scope="$1"
+  tmux list-sessions \
+    -F '#{session_name}	#{session_path}	#{session_attached}	#{session_created}' \
+    2>/dev/null \
+    | awk -F'\t' -v prefix="$SESSION_PREFIX" -v here="$PWD" -v scope="$scope" '
+        $1 ~ "^"prefix {
+          if (scope == "all") { print; next }
+          if ($2 == here || index($2, here "/") == 1) print
+        }'
+}
+
+# Attach to a session; switch-client if we are already inside tmux.
+_attach() {
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$1"
+  else
+    tmux attach -t "$1"
+  fi
+}
+
+# ---------- help ----------
+
+usage() {
+  cat <<EOF
+$PROG $VERSION - manage multiple claude sessions via tmux
+
+USAGE:
+  $PROG <command> [args]
+
+COMMANDS:
+  list, ls            List claude sessions whose working dir is under \$PWD
+  new   [name]        Start a new claude session in \$PWD and attach to it
+  resume [name|#]     Attach to an existing claude session (by name or list #)
+  kill   <name|#>     Kill a claude session (use --all to kill all under \$PWD)
+  install [--system]  Install $PROG to ~/.local/bin (or /usr/local/bin)
+  help [command]      Show help; pass a command name for details
+  version             Print version
+
+EXAMPLES:
+  $PROG install                # install for current user
+  $PROG new                    # start a claude session in this directory
+  $PROG new feature-x          # start a session named claude-feature-x
+  $PROG list                   # show claude sessions under this dir tree
+  $PROG list --all             # show every claude session on the host
+  $PROG resume                 # pick interactively from the list
+  $PROG resume 2               # attach to session #2 from 'list'
+  $PROG resume feature-x       # attach by name (prefix optional)
+  $PROG kill feature-x         # kill session claude-feature-x
+  $PROG kill --all             # kill every claude session under this dir tree
+EOF
+}
+
+help_for() {
+  case "${1:-}" in
+    list|ls)
+      cat <<EOF
+$PROG list [--all]
+
+List claude sessions managed by $PROG. By default only sessions whose
+working directory is at or under \$PWD are shown.
+
+Options:
+  --all   Show every claude session on the host, regardless of directory.
+EOF
+      ;;
+    new|start)
+      cat <<EOF
+$PROG new [name]
+
+Create a new tmux session in the current directory running 'claude', then
+attach to it. The session name is 'claude-<name>' or, if no name is given,
+'claude-<basename-of-cwd>'. A numeric suffix (-2, -3, ...) is appended if
+that name is already taken.
+EOF
+      ;;
+    resume|attach|a)
+      cat <<EOF
+$PROG resume [name|index]
+
+Attach to an existing claude session. The argument may be:
+  - the list index shown by '$PROG list'
+  - the full tmux session name (e.g. claude-feature-x)
+  - the suffix only         (e.g. feature-x)
+
+With no argument the list is printed and you are prompted to pick one.
+EOF
+      ;;
+    kill|stop)
+      cat <<EOF
+$PROG kill <name|index>
+$PROG kill --all [--force]
+
+Kill claude sessions.
+
+With a name or list index, kills that one session (name may include or
+omit the 'claude-' prefix). With --all, kills every claude session whose
+working directory is at or under \$PWD; this prompts for confirmation
+unless --force is given.
+EOF
+      ;;
+    install)
+      cat <<EOF
+$PROG install [--system] [--force]
+
+Copy this script to a directory on PATH.
+  (default)   install to ~/.local/bin/$PROG
+  --system    install to /usr/local/bin/$PROG  (may require sudo)
+  --force     overwrite an existing file without prompting
+
+After installing, make sure the destination directory is on your PATH.
+EOF
+      ;;
+    version|-v|--version)
+      printf '%s version\n\nPrint the program version.\n' "$PROG"
+      ;;
+    ""|help|-h|--help)
+      usage
+      ;;
+    *)
+      die "no help for unknown command: $1"
+      ;;
+  esac
+}
+
+# ---------- commands ----------
+
+cmd_list() {
+  need tmux
+  local scope="here"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)      scope="all" ;;
+      -h|--help)  help_for list; return 0 ;;
+      *)          die "unknown option: $1 (try '$PROG help list')" ;;
+    esac
+    shift
+  done
+
+  local rows; rows=$(_collect_sessions "$scope") || true
+  if [ -z "$rows" ]; then
+    if [ "$scope" = "here" ]; then
+      printf 'no claude sessions under %s\n' "$PWD"
+    else
+      printf 'no claude sessions on this host\n'
+    fi
+    return 0
+  fi
+
+  printf '%-3s  %-28s  %-8s  %-10s  %s\n' '#' 'NAME' 'ATTACHED' 'AGE' 'PATH'
+  local i=0 name path attached created att
+  while IFS=$'\t' read -r name path attached created; do
+    i=$((i+1))
+    att="no"; [ "${attached:-0}" -gt 0 ] && att="yes"
+    printf '%-3s  %-28s  %-8s  %-10s  %s\n' \
+      "$i" "$name" "$att" "$(_human_age "$created")" "$path"
+  done <<< "$rows"
+}
+
+cmd_new() {
+  need tmux
+  need claude
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) help_for new; return 0 ;;
+      --)        shift; break ;;
+      -*)        die "unknown option: $1 (try '$PROG help new')" ;;
+      *)         break ;;
+    esac
+    shift
+  done
+
+  local base="${1:-$(basename "$PWD")}"
+  # tmux session names cannot contain '.' or ':'
+  base="${base//[.:]/_}"
+  local name="${SESSION_PREFIX}${base}"
+  if tmux has-session -t "=$name" 2>/dev/null; then
+    local n=2
+    while tmux has-session -t "=${name}-${n}" 2>/dev/null; do n=$((n+1)); done
+    name="${name}-${n}"
+  fi
+
+  tmux new-session -d -s "$name" -c "$PWD" "claude"
+  printf 'started %s in %s\n' "$name" "$PWD"
+  _attach "$name"
+}
+
+cmd_resume() {
+  need tmux
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) help_for resume; return 0 ;;
+      --)        shift; break ;;
+      -*)        die "unknown option: $1 (try '$PROG help resume')" ;;
+      *)         break ;;
+    esac
+    shift
+  done
+
+  local arg="${1:-}"
+  local rows; rows=$(_collect_sessions "here") || true
+  if [ -z "$rows" ] && [ -z "$arg" ]; then
+    die "no claude sessions under $PWD (try '$PROG new' or '$PROG list --all')"
+  fi
+
+  if [ -z "$arg" ]; then
+    cmd_list
+    printf '\nselect # (or name): '
+    read -r arg || die "no selection"
+    [ -z "$arg" ] && die "no selection"
+  fi
+
+  local target=""
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    target=$(awk -F'\t' -v n="$arg" 'NR==n {print $1; exit}' <<< "$rows")
+    [ -z "$target" ] && die "no session #$arg in list"
+  elif tmux has-session -t "=$arg" 2>/dev/null; then
+    target="$arg"
+  elif tmux has-session -t "=${SESSION_PREFIX}${arg}" 2>/dev/null; then
+    target="${SESSION_PREFIX}${arg}"
+  else
+    die "no session matches: $arg"
+  fi
+
+  _attach "$target"
+}
+
+cmd_kill() {
+  need tmux
+  local all=0 force=0
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)      all=1 ;;
+      -f|--force) force=1 ;;
+      -h|--help)  help_for kill; return 0 ;;
+      --)         shift; args+=("$@"); break ;;
+      -*)         die "unknown option: $1 (try '$PROG help kill')" ;;
+      *)          args+=("$1") ;;
+    esac
+    shift
+  done
+
+  if [ "$all" -eq 1 ]; then
+    [ ${#args[@]} -gt 0 ] && die "cannot combine --all with a name or index"
+    local rows; rows=$(_collect_sessions "here") || true
+    if [ -z "$rows" ]; then
+      printf 'no claude sessions under %s\n' "$PWD"
+      return 0
+    fi
+    if [ "$force" -ne 1 ]; then
+      local count; count=$(printf '%s\n' "$rows" | wc -l)
+      printf 'kill %d session(s) under %s? [y/N] ' "$count" "$PWD"
+      read -r ans || ans=""
+      case "$ans" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
+    fi
+    local name _rest
+    while IFS=$'\t' read -r name _rest; do
+      if tmux kill-session -t "=$name" 2>/dev/null; then
+        printf 'killed %s\n' "$name"
+      else
+        printf 'failed to kill %s\n' "$name" >&2
+      fi
+    done <<< "$rows"
+    return 0
+  fi
+
+  [ ${#args[@]} -eq 0 ] && die "missing session name or # (try '$PROG help kill')"
+  local arg="${args[0]}"
+  local target=""
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    local rows; rows=$(_collect_sessions "here") || true
+    target=$(awk -F'\t' -v n="$arg" 'NR==n {print $1; exit}' <<< "$rows")
+    [ -z "$target" ] && die "no session #$arg in list (under $PWD)"
+  elif tmux has-session -t "=$arg" 2>/dev/null; then
+    target="$arg"
+  elif tmux has-session -t "=${SESSION_PREFIX}${arg}" 2>/dev/null; then
+    target="${SESSION_PREFIX}${arg}"
+  else
+    die "no session matches: $arg"
+  fi
+  tmux kill-session -t "=$target"
+  printf 'killed %s\n' "$target"
+}
+
+cmd_install() {
+  local dest_dir="$HOME/.local/bin"
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --system)   dest_dir="/usr/local/bin" ;;
+      --force)    force=1 ;;
+      -h|--help)  help_for install; return 0 ;;
+      *)          die "unknown option: $1 (try '$PROG help install')" ;;
+    esac
+    shift
+  done
+
+  local src dest
+  src="$(_self_path)"
+  dest="$dest_dir/cmm"
+
+  mkdir -p "$dest_dir" 2>/dev/null || true
+  [ -d "$dest_dir" ] || die "destination directory does not exist: $dest_dir"
+  [ -w "$dest_dir" ] || die "destination directory is not writable: $dest_dir (try sudo)"
+
+  if [ -e "$dest" ] && [ "$force" -ne 1 ]; then
+    if [ "$src" -ef "$dest" ]; then
+      printf 'already installed at %s\n' "$dest"
+      return 0
+    fi
+    printf 'overwrite existing %s? [y/N] ' "$dest"
+    read -r ans || ans=""
+    case "$ans" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
+  fi
+
+  install -m 0755 "$src" "$dest" 2>/dev/null \
+    || { cp "$src" "$dest" && chmod 0755 "$dest"; }
+  printf 'installed: %s\n' "$dest"
+
+  case ":$PATH:" in
+    *":$dest_dir:"*) ;;
+    *) printf 'note: %s is not on your PATH\n' "$dest_dir" ;;
+  esac
+}
+
+cmd_version() { printf '%s %s\n' "$PROG" "$VERSION"; }
+
+# ---------- dispatch ----------
+
+main() {
+  if [ $# -eq 0 ]; then usage; exit 0; fi
+  local cmd="$1"; shift
+  case "$cmd" in
+    list|ls)              cmd_list    "$@" ;;
+    new|start)            cmd_new     "$@" ;;
+    resume|attach|a)      cmd_resume  "$@" ;;
+    kill|stop)            cmd_kill    "$@" ;;
+    install)              cmd_install "$@" ;;
+    help|-h|--help)       help_for    "${1:-}" ;;
+    version|-v|--version) cmd_version ;;
+    *) die "unknown command: $cmd (try '$PROG help')" ;;
+  esac
+}
+
+main "$@"
