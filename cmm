@@ -4,19 +4,22 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 PROG="$(basename "${0}")"
 SESSION_PREFIX="claude-"
+KEEPALIVE_SESSION="cmm-keepalive"
 
 # ---------- helpers ----------
 
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+log()  { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
 need() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-# Resolve the real path to this script (used by `install`).
+# Resolve the real path to this script (used by `install` and `keepalive --daemon`).
 _self_path() {
   local src="${BASH_SOURCE[0]}" dir
   while [ -h "$src" ]; do
@@ -35,6 +38,17 @@ _human_age() {
   elif (( secs < 86400 )); then printf '%dh ago' $(( secs /  3600 ))
   else                          printf '%dd ago' $(( secs / 86400 ))
   fi
+}
+
+# Quote arguments for a POSIX shell. tmux runs pane commands through the
+# user's shell, so every argument we hand it must be quoted.
+_shell_join() {
+  local out="" a q="'"
+  for a in "$@"; do
+    a="$q${a//$q/$q\\$q$q}$q"
+    out="${out:+$out }$a"
+  done
+  printf '%s' "$out"
 }
 
 # Print "NAME<TAB>PATH<TAB>ATTACHED<TAB>CREATED_EPOCH" for matching sessions.
@@ -60,6 +74,332 @@ _attach() {
   fi
 }
 
+# Resolve a session reference (list #, full name, or name without the
+# 'claude-' prefix) to a tmux session name. Dies if nothing matches.
+_resolve_session() {
+  local arg="$1" rows target=""
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    rows=$(_collect_sessions "here") || true
+    target=$(awk -F'\t' -v n="$arg" 'NR==n {print $1; exit}' <<< "$rows")
+    [ -n "$target" ] || die "no session #$arg in list (under $PWD)"
+  elif tmux has-session -t "=$arg" 2>/dev/null; then
+    target="$arg"
+  elif tmux has-session -t "=${SESSION_PREFIX}${arg}" 2>/dev/null; then
+    target="${SESSION_PREFIX}${arg}"
+  else
+    die "no session matches: $arg"
+  fi
+  printf '%s\n' "$target"
+}
+
+# Show the list under $PWD and let the user pick one; prints the session name.
+_pick_session() {
+  local rows arg
+  rows=$(_collect_sessions "here") || true
+  [ -n "$rows" ] || die "no claude sessions under $PWD (try '$PROG new' or '$PROG list --all')"
+  cmd_list >&2
+  printf '\nselect # (or name): ' >&2
+  read -r arg || die "no selection"
+  [ -n "$arg" ] || die "no selection"
+  _resolve_session "$arg"
+}
+
+# The cmm session this command is running inside, if any.
+_current_session() {
+  local n
+  [ -n "${TMUX:-}" ] || return 0
+  n=$(tmux display-message -p '#{session_name}' 2>/dev/null) || return 0
+  case "$n" in "$SESSION_PREFIX"*) printf '%s\n' "$n" ;; esac
+}
+
+# ---------- pane inspection ----------
+# cmm sessions run claude directly in a single pane. These helpers read that
+# pane's screen to learn what claude is doing; they never type into it.
+
+# The pane running claude in a session (falls back to the first pane).
+_claude_pane() {
+  local id cmd first=""
+  while read -r id cmd; do
+    [ -n "$first" ] || first="$id"
+    case "$cmd" in claude|claude.exe|node) printf '%s\n' "$id"; return 0 ;; esac
+  done < <(tmux list-panes -s -t "=$1" -F '#{pane_id} #{pane_current_command}' 2>/dev/null)
+  printf '%s\n' "$first"
+}
+
+_pane_fmt()    { tmux display-message -p -t "$1" "$2" 2>/dev/null || true; }
+_pane_dead()   { [ "$(_pane_fmt "$1" '#{pane_dead}')" = "1" ]; }
+
+# Visible text of a pane, wrapped lines joined and trailing blank lines dropped
+# (a detached pane can be taller than the screen claude last drew).
+_pane_text() {
+  tmux capture-pane -p -J -t "$1" 2>/dev/null \
+    | awk '{ l[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR }
+           END { for (i = 1; i <= last; i++) print l[i] }' || true
+}
+_pane_footer() { _pane_text "$1" | tail -n 10; }
+
+# What claude in a pane is doing, judged from its screen:
+#   busy    working on a turn ("esc to interrupt" in the footer)
+#   empty   idle at an empty prompt
+#   typing  idle, but there is unsent text in the prompt
+#   none    no prompt visible (dialog open, still starting, not claude, ...)
+_pane_input_state() {
+  case "$(_pane_footer "$1")" in *"esc to interrupt"*) printf 'busy\n'; return ;; esac
+  _pane_prompt_scan "$1" | cut -f1
+}
+
+# The text a person has typed into the prompt (trimmed; empty if none).
+_pane_prompt_typed() {
+  _pane_prompt_scan "$1" | cut -f2-
+}
+
+# Read the input box with its colour codes and print "STATE<TAB>TYPED".
+# The input box is the last line that starts with the prompt marker.
+# Placeholder hints and prompt suggestions are drawn dim (SGR 2); text the
+# user typed is not, so only non-dim text counts as typed.
+_pane_prompt_scan() {
+  { tmux capture-pane -p -e -J -t "$1" 2>/dev/null || true; } | LC_ALL=C awk -v nb="$(printf '\302\240')" '
+    {
+      plain = $0; gsub(/\033\[[0-9;]*m/, "", plain)
+      if (plain ~ /^❯/) raw = $0
+    }
+    END {
+      if (raw == "") { print "none\t"; exit }
+      sub(/^(\033\[[0-9;]*m)*❯/, "", raw)
+      gsub(nb, " ", raw)
+      dim = 0; typed = ""; s = raw
+      while (length(s) > 0) {
+        if (match(s, /\033\[[0-9;]*m/)) {
+          if (!dim) typed = typed substr(s, 1, RSTART - 1)
+          n = split(substr(s, RSTART + 2, RLENGTH - 3), p, ";")
+          if (n == 0) dim = 0
+          for (i = 1; i <= n; i++) {
+            if (p[i] == "0" || p[i] == "22" || p[i] == "") dim = 0
+            else if (p[i] == "2") dim = 1
+          }
+          s = substr(s, RSTART + RLENGTH)
+        } else {
+          if (!dim) typed = typed s
+          s = ""
+        }
+      }
+      sub(/^[ \t]+/, "", typed); sub(/[ \t]+$/, "", typed)
+      print (typed == "" ? "empty" : "typing") "\t" typed
+    }'
+}
+
+# Type a slash command into claude's prompt and submit it. Characters go one
+# at a time (a burst can be taken for a paste and merged with a prompt
+# suggestion), and Enter is only pressed once the prompt shows exactly the
+# command. Returns 1 if the command could not be put into the prompt.
+_type_command() {
+  local pane="$1" cmd="$2" attempt i
+  for attempt in 1 2; do
+    for (( i = 0; i < ${#cmd}; i++ )); do
+      tmux send-keys -l -t "$pane" "${cmd:i:1}"
+      sleep 0.05
+    done
+    sleep 0.5
+    if [ "$(_pane_prompt_typed "$pane")" = "$cmd" ]; then
+      tmux send-keys -t "$pane" Enter
+      return 0
+    fi
+    tmux send-keys -t "$pane" C-c   # clear whatever ended up there and try once more
+    sleep 0.7
+  done
+  return 1
+}
+
+# Remote Control state shown in the footer: active|failed|reconnecting|connecting|off
+_pane_rc_state() {
+  case "$(_pane_footer "$1")" in
+    *"/rc failed"*)         printf 'failed\n' ;;
+    *"/rc reconnecting"*)   printf 'reconnecting\n' ;;
+    *"/rc connecting"*)     printf 'connecting\n' ;;
+    *"/rc active"*|*"/rc"*) printf 'active\n' ;;
+    *)                      printf 'off\n' ;;
+  esac
+}
+
+# True if claude's footer says a newer version is installed and waiting for a restart.
+_pane_update_ready() {
+  case "$(_pane_footer "$1")" in *"Restart to apply"*|*"Update installed"*) return 0 ;; esac
+  return 1
+}
+
+# True if claude says Remote Control can only be retried after a restart.
+_pane_rc_needs_restart() {
+  case "$(_pane_text "$1" | tail -n 15)" in *"restart to retry"*) return 0 ;; esac
+  return 1
+}
+
+# True if a client attached to the session has had keyboard activity within $2 seconds.
+_session_recently_active() {
+  local now t
+  now=$(date +%s)
+  while read -r t; do
+    [ -n "$t" ] && [ $(( now - t )) -lt "$2" ] && return 0
+  done < <(tmux list-clients -t "=$1" -F '#{client_activity}' 2>/dev/null)
+  return 1
+}
+
+# Short status summary for `list`: state[,update-ready][,rc:...]
+_pane_tags() {
+  local pane="$1" tags rc
+  [ -n "$pane" ] || { printf '?\n'; return; }
+  if _pane_dead "$pane"; then printf 'exited\n'; return; fi
+  case "$(_pane_input_state "$pane")" in
+    busy)   tags="busy" ;;
+    typing) tags="typing" ;;
+    empty)  tags="idle" ;;
+    *)      tags="dialog" ;;
+  esac
+  if _pane_update_ready "$pane"; then tags="$tags,update-ready"; fi
+  rc=$(_pane_rc_state "$pane")
+  case "$rc" in
+    active) tags="$tags,rc:on" ;;
+    *)      tags="$tags,rc:$rc" ;;
+  esac
+  printf '%s\n' "$tags"
+}
+
+# ---------- restart machinery ----------
+
+# Set (or unset) remain-on-exit on a pane so it survives claude exiting.
+_set_remain() {
+  if [ "$2" = "unset" ]; then
+    tmux set-option -p -t "$1" -u remain-on-exit 2>/dev/null \
+      || tmux set-option -w -t "$1" -u remain-on-exit 2>/dev/null || true
+  else
+    tmux set-option -p -t "$1" remain-on-exit "$2" 2>/dev/null \
+      || tmux set-option -w -t "$1" remain-on-exit "$2"
+  fi
+}
+
+# Ask the claude in a pane to exit and wait up to $2 seconds for the pane to die.
+# Escape closes any open menu (or interrupts a running turn), Ctrl-C clears
+# unsent input, then /exit shuts claude down cleanly so it prints its resume hint.
+_exit_claude() {
+  local pane="$1" wait="${2:-30}" i=0
+  tmux send-keys -t "$pane" Escape
+  tmux send-keys -t "$pane" C-c
+  sleep 0.5
+  if ! _type_command "$pane" '/exit'; then
+    # Could not get /exit into the prompt. Ctrl-C twice on an empty prompt
+    # also shuts claude down cleanly (and prints the resume hint).
+    tmux send-keys -t "$pane" C-c; sleep 0.4; tmux send-keys -t "$pane" C-c
+  fi
+  until _pane_dead "$pane"; do
+    i=$(( i + 1 ))
+    [ "$i" -lt "$wait" ] || return 1
+    sleep 1
+    [ $(( i % 4 )) -eq 0 ] || continue
+    if [ "$(_pane_prompt_typed "$pane")" = "/exit" ]; then
+      tmux send-keys -t "$pane" Enter               # Enter was swallowed; press it again
+    elif [ "$i" -ge 8 ]; then
+      case "$(_pane_input_state "$pane")" in
+        busy)  tmux send-keys -t "$pane" Escape ;;  # something got submitted by accident; interrupt it
+        empty) tmux send-keys -t "$pane" C-c; sleep 0.4; tmux send-keys -t "$pane" C-c ;;
+      esac
+    fi
+  done
+}
+
+# Extract the argument of `--resume` from claude's exit hint:
+#   Resume this session with:
+#   claude [--worktree <name> ]--resume <session-id or "name">
+_parse_resume_arg() {
+  local line re_uuid re_name
+  line=$(printf '%s\n' "$1" | LC_ALL=C grep -A2 -F 'Resume this session with:' \
+         | LC_ALL=C grep -F -- '--resume' | tail -n 1) || true
+  [ -n "$line" ] || return 0
+  re_uuid='--resume[[:space:]]+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+  re_name='--resume[[:space:]]+"((\\.|[^"\\])*)"'
+  if [[ "$line" =~ $re_uuid ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ $re_name ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}" | sed -e 's/\\\(.\)/\1/g'
+  fi
+}
+
+# Extract the --worktree name from the exit hint, if claude printed one.
+_parse_worktree() {
+  local line re
+  line=$(printf '%s\n' "$1" | LC_ALL=C grep -A2 -F 'Resume this session with:' \
+         | LC_ALL=C grep -F -- '--resume' | tail -n 1) || true
+  re='--worktree[[:space:]]+([A-Za-z0-9._/-]+)'
+  if [[ "$line" =~ $re ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
+}
+
+# Restart claude in place inside session $1, resuming the same conversation.
+# $2 = 1 to force (interrupt a busy claude / discard unsent input).
+# Remaining arguments are passed to the new claude.
+_restart_session() {
+  local name="$1" force="$2"; shift 2
+  local pane path state rc text arg wt i
+  local -a cmd
+  pane=$(_claude_pane "$name")
+  [ -n "$pane" ] || { warn "$name: no pane found"; return 1; }
+  if [ "${TMUX_PANE:-}" = "$pane" ]; then
+    warn "$name: this command is running inside that session's claude; run it from another tmux window or terminal"
+    return 1
+  fi
+  path=$(_pane_fmt "$pane" '#{pane_current_path}')
+  rc=$(_pane_rc_state "$pane")
+
+  if _pane_dead "$pane"; then
+    printf '%s: claude already exited; ' "$name"
+  else
+    state=$(_pane_input_state "$pane")
+    if [ "$force" -ne 1 ]; then
+      case "$state" in
+        busy)   warn "$name: claude is working (esc to interrupt); skipped, use --force to interrupt it"; return 1 ;;
+        typing) warn "$name: unsent text in the prompt; skipped, use --force to discard it"; return 1 ;;
+        none)   warn "$name: claude is not at an idle prompt (dialog open?); skipped, use --force"; return 1 ;;
+      esac
+    fi
+    _set_remain "$pane" on
+    printf '%s: stopping claude... ' "$name"
+    if ! _exit_claude "$pane" 30; then
+      printf 'no\n'
+      _set_remain "$pane" unset
+      warn "$name: claude did not exit within 30s; left running"
+      return 1
+    fi
+  fi
+
+  text=$(tmux capture-pane -p -J -t "$pane" -S -300 2>/dev/null || true)
+  arg=$(_parse_resume_arg "$text")
+  wt=$(_parse_worktree "$text")
+  cmd=(claude)
+  if [ -n "$wt" ]; then cmd+=(--worktree "$wt"); fi
+  if [ -n "$arg" ]; then
+    cmd+=(--resume "$arg")
+  else
+    warn "$name: no resume hint found on screen; using --continue (most recent conversation in $path)"
+    cmd+=(--continue)
+  fi
+  if [ $# -gt 0 ]; then cmd+=("$@"); fi
+  if [ "$rc" != "off" ]; then cmd+=(--remote-control); fi
+
+  _set_remain "$pane" on
+  tmux respawn-pane -k -t "$pane" -c "$path" "$(_shell_join "${cmd[@]}")"
+  # Give claude a few seconds to come up. If it dies immediately, keep the
+  # dead pane so the error stays readable.
+  i=0
+  while [ "$i" -lt 10 ]; do
+    if _pane_dead "$pane"; then
+      printf 'failed\n'
+      warn "$name: claude exited right after restarting; the pane was kept so you can read why ('$PROG resume $name')"
+      return 1
+    fi
+    case "$(_pane_text "$pane")" in *"❯"*) break ;; esac
+    sleep 1; i=$(( i + 1 ))
+  done
+  _set_remain "$pane" unset
+  printf 'restarted (resumed %s)\n' "${arg:-most recent conversation}"
+}
+
 # ---------- help ----------
 
 usage() {
@@ -73,6 +413,11 @@ COMMANDS:
   list, ls            List claude sessions whose working dir is under \$PWD
   new   [name]        Start a new claude session in \$PWD and attach to it
   resume [name|#]     Attach to an existing claude session (by name or list #)
+  update [name|#]     Restart a session's claude on the latest version, keeping
+                      its conversation (--all / --pending for several at once)
+  restart [name|#]    Same as update, but skip 'claude update'
+  keepalive           Reconnect Remote Control in sessions where it has failed
+                      (--daemon to keep doing so in the background)
   kill   <name|#>     Kill a claude session (use --all to kill all under \$PWD)
   install [--system]  Install $PROG to ~/.local/bin (or /usr/local/bin)
   help [command]      Show help; pass a command name for details
@@ -87,6 +432,9 @@ EXAMPLES:
   $PROG resume                 # pick interactively from the list
   $PROG resume 2               # attach to session #2 from 'list'
   $PROG resume feature-x       # attach by name (prefix optional)
+  $PROG update feature-x       # restart claude-feature-x on the new version
+  $PROG update --pending       # restart every session waiting for an update
+  $PROG keepalive --daemon     # keep Remote Control reconnected, in background
   $PROG kill feature-x         # kill session claude-feature-x
   $PROG kill --all             # kill every claude session under this dir tree
 EOF
@@ -103,16 +451,26 @@ working directory is at or under \$PWD are shown.
 
 Options:
   --all   Show every claude session on the host, regardless of directory.
+
+The STATUS column is read from each session's screen:
+  idle | busy | typing | dialog   what claude is doing right now
+  update-ready                    a newer Claude Code is installed and waiting
+                                  for a restart ('$PROG update')
+  rc:on | rc:failed | rc:off ...  Remote Control state ('$PROG keepalive')
 EOF
       ;;
     new|start)
       cat <<EOF
-$PROG new [name]
+$PROG new [name] [-- <claude args>]
 
 Create a new tmux session in the current directory running 'claude', then
 attach to it. The session name is 'claude-<name>' or, if no name is given,
 'claude-<basename-of-cwd>'. A numeric suffix (-2, -3, ...) is appended if
 that name is already taken.
+
+Anything after '--' is passed to claude, for example:
+  $PROG new api -- --model opus
+  $PROG new -- --remote-control
 EOF
       ;;
     resume|attach|a)
@@ -125,6 +483,84 @@ Attach to an existing claude session. The argument may be:
   - the suffix only         (e.g. feature-x)
 
 With no argument the list is printed and you are prompted to pick one.
+EOF
+      ;;
+    update|upgrade)
+      cat <<EOF
+$PROG update [name|index ...] [--all | --pending] [--force] [--restart-only]
+$PROG update ... [-- <claude args>]
+
+Restart the claude inside a session so it runs the newly installed Claude
+Code version, without losing the conversation. For each session $PROG:
+  1. asks claude to exit (/exit),
+  2. reads the "Resume this session with: claude --resume <id>" hint that
+     claude prints on the way out,
+  3. starts 'claude --resume <id>' again in the same tmux pane.
+The tmux session, its name and any attached clients stay as they are, and
+Remote Control is turned back on if the session had it.
+
+Before restarting anything, 'claude update' is run once so the latest
+version is installed ('$PROG restart' or --restart-only skips that step).
+
+Which sessions:
+  (none)       the session you are in when run from a second window of a
+               $PROG tmux session; otherwise pick from the list under \$PWD
+  name|index   one or more sessions (list #, or name with/without 'claude-')
+  --all        every session at or under \$PWD (run it from ~ to get them all)
+  --pending    like --all, but only sessions whose footer says
+               "Update installed · Restart to apply"
+
+Options:
+  -f, --force      also restart sessions that are busy, have unsent text in
+                   the prompt, or are showing a dialog (they get interrupted)
+  --restart-only   do not run 'claude update' first
+  -- <args>        extra arguments for the restarted claude
+
+Sessions that are busy or not sitting at an empty prompt are skipped unless
+--force is given. Run this from outside the claude you are restarting (a
+second tmux window, or another terminal); it refuses to restart itself.
+EOF
+      ;;
+    restart)
+      cat <<EOF
+$PROG restart [name|index ...] [--all | --pending] [--force] [-- <claude args>]
+
+Same as '$PROG update --restart-only': stop the claude in a session and
+resume the same conversation in the same tmux pane on whatever Claude Code
+version is installed, without checking for updates first.
+See '$PROG help update' for the details.
+EOF
+      ;;
+    keepalive|watchdog)
+      cat <<EOF
+$PROG keepalive [--interval SECS] [--once] [--dry-run] [--restart] [--ensure]
+$PROG keepalive --daemon [same options]
+$PROG keepalive --status | --stop
+
+Keep Remote Control connected in sessions that sit idle for hours.
+
+Claude Code retries a dropped Remote Control connection for about 30
+minutes (for example after a network outage or the host sleeping), then
+gives up and shows "/rc failed" in the footer until somebody runs
+/remote-control in that session. keepalive checks every claude-* session
+on this host and, when one shows "/rc failed" while idle at an empty
+prompt, types /remote-control for you.
+
+Options:
+  --interval SECS  seconds between checks (default 300)
+  --once           run a single check and exit
+  --dry-run        report what would be done without typing anything
+  --restart        if claude refuses to reconnect and asks for a restart,
+                   restart that session in place (like '$PROG restart')
+  --ensure         also turn Remote Control on in sessions that have it off
+  -d, --daemon     run the loop detached, in a tmux session named
+                   '$KEEPALIVE_SESSION' (keeps running after you log out)
+  --status         show whether the daemon is running, and its recent log
+  --stop           stop the daemon
+
+Sessions that are busy, have unsent text in the prompt, show a dialog, or
+had keyboard activity in the last two minutes are left alone and checked
+again next time.
 EOF
       ;;
     kill|stop)
@@ -188,30 +624,35 @@ cmd_list() {
     return 0
   fi
 
-  printf '%-3s  %-28s  %-8s  %-10s  %s\n' '#' 'NAME' 'ATTACHED' 'AGE' 'PATH'
-  local i=0 name path attached created att
+  local w
+  w=$(awk -F'\t' '{ if (length($1) > m) m = length($1) } END { print (m > 4 ? m : 4) }' <<< "$rows")
+  printf "%-3s  %-${w}s  %-8s  %-8s  %-28s  %s\n" '#' 'NAME' 'ATTACHED' 'AGE' 'STATUS' 'PATH'
+  local i=0 name path attached created att tags
   while IFS=$'\t' read -r name path attached created; do
     i=$((i+1))
     att="no"; [ "${attached:-0}" -gt 0 ] && att="yes"
-    printf '%-3s  %-28s  %-8s  %-10s  %s\n' \
-      "$i" "$name" "$att" "$(_human_age "$created")" "$path"
+    tags=$(_pane_tags "$(_claude_pane "$name")")
+    printf "%-3s  %-${w}s  %-8s  %-8s  %-28s  %s\n" \
+      "$i" "$name" "$att" "$(_human_age "$created")" "$tags" "$path"
   done <<< "$rows"
 }
 
 cmd_new() {
   need tmux
   need claude
+  local name_arg="" extra=()
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) help_for new; return 0 ;;
-      --)        shift; break ;;
+      --)        shift; extra=("$@"); break ;;
       -*)        die "unknown option: $1 (try '$PROG help new')" ;;
-      *)         break ;;
+      *)         [ -z "$name_arg" ] || die "unexpected argument: $1 (try '$PROG help new')"
+                 name_arg="$1" ;;
     esac
     shift
   done
 
-  local base="${1:-$(basename "$PWD")}"
+  local base="${name_arg:-$(basename "$PWD")}"
   # tmux session names cannot contain '.' or ':'
   base="${base//[.:]/_}"
   local name="${SESSION_PREFIX}${base}"
@@ -221,7 +662,7 @@ cmd_new() {
     name="${name}-${n}"
   fi
 
-  tmux new-session -d -s "$name" -c "$PWD" "claude"
+  tmux new-session -d -s "$name" -c "$PWD" "$(_shell_join claude ${extra[@]+"${extra[@]}"})"
   printf 'started %s in %s\n' "$name" "$PWD"
   _attach "$name"
 }
@@ -238,32 +679,209 @@ cmd_resume() {
     shift
   done
 
-  local arg="${1:-}"
-  local rows; rows=$(_collect_sessions "here") || true
-  if [ -z "$rows" ] && [ -z "$arg" ]; then
-    die "no claude sessions under $PWD (try '$PROG new' or '$PROG list --all')"
-  fi
-
-  if [ -z "$arg" ]; then
-    cmd_list
-    printf '\nselect # (or name): '
-    read -r arg || die "no selection"
-    [ -z "$arg" ] && die "no selection"
-  fi
-
-  local target=""
-  if [[ "$arg" =~ ^[0-9]+$ ]]; then
-    target=$(awk -F'\t' -v n="$arg" 'NR==n {print $1; exit}' <<< "$rows")
-    [ -z "$target" ] && die "no session #$arg in list"
-  elif tmux has-session -t "=$arg" 2>/dev/null; then
-    target="$arg"
-  elif tmux has-session -t "=${SESSION_PREFIX}${arg}" 2>/dev/null; then
-    target="${SESSION_PREFIX}${arg}"
+  local target
+  if [ -n "${1:-}" ]; then
+    target=$(_resolve_session "$1")
   else
-    die "no session matches: $arg"
+    target=$(_pick_session)
+  fi
+  _attach "$target"
+}
+
+cmd_update() {
+  need tmux
+  need claude
+  local all=0 pending=0 force=0 do_update=1 n target pane
+  local -a names=() extra=() targets=() kept=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)                    all=1 ;;
+      --pending)                pending=1; all=1 ;;
+      -f|--force)               force=1 ;;
+      --restart-only|--no-update) do_update=0 ;;
+      -h|--help)                help_for update; return 0 ;;
+      --)                       shift; extra=("$@"); break ;;
+      -*)                       die "unknown option: $1 (try '$PROG help update')" ;;
+      *)                        names+=("$1") ;;
+    esac
+    shift
+  done
+
+  if [ "$all" -eq 1 ]; then
+    [ ${#names[@]} -eq 0 ] || die "cannot combine --all/--pending with a name or index"
+    local rows name _rest
+    rows=$(_collect_sessions "here") || true
+    if [ -z "$rows" ]; then printf 'no claude sessions under %s\n' "$PWD"; return 0; fi
+    while IFS=$'\t' read -r name _rest; do targets+=("$name"); done <<< "$rows"
+  elif [ ${#names[@]} -gt 0 ]; then
+    for n in "${names[@]}"; do
+      target=$(_resolve_session "$n")
+      targets+=("$target")
+    done
+  else
+    target=$(_current_session)
+    if [ -z "$target" ]; then target=$(_pick_session); fi
+    targets=("$target")
   fi
 
-  _attach "$target"
+  if [ "$pending" -eq 1 ]; then
+    for n in "${targets[@]}"; do
+      pane=$(_claude_pane "$n")
+      if [ -n "$pane" ] && _pane_update_ready "$pane"; then kept+=("$n"); fi
+    done
+    if [ ${#kept[@]} -eq 0 ]; then printf 'no sessions under %s are waiting for a restart\n' "$PWD"; return 0; fi
+    targets=("${kept[@]}")
+  fi
+
+  if [ "$do_update" -eq 1 ]; then
+    printf 'checking for claude updates...\n'
+    claude update || die "'claude update' failed; no sessions were restarted (use --restart-only to restart anyway)"
+  fi
+
+  local ok=0 skipped=0
+  for n in "${targets[@]}"; do
+    if _restart_session "$n" "$force" ${extra[@]+"${extra[@]}"}; then
+      ok=$((ok+1))
+    else
+      skipped=$((skipped+1))
+    fi
+  done
+  if [ ${#targets[@]} -gt 1 ]; then
+    printf '%d restarted, %d skipped\n' "$ok" "$skipped"
+  fi
+  [ "$skipped" -eq 0 ]
+}
+
+cmd_restart() {
+  cmd_update --restart-only "$@"
+}
+
+# One keepalive check over every claude-* session on the host.
+_keepalive_pass() {
+  local dry="$1" restart="$2" ensure="$3"
+  local rows name _rest pane rc state
+  rows=$(_collect_sessions "all") || true
+  [ -n "$rows" ] || return 0
+  while IFS=$'\t' read -r name _rest; do
+    [ -n "$name" ] || continue
+    pane=$(_claude_pane "$name")
+    [ -n "$pane" ] || continue
+    if _pane_dead "$pane"; then continue; fi
+    rc=$(_pane_rc_state "$pane")
+    case "$rc" in
+      failed) ;;
+      off)    [ "$ensure" -eq 1 ] || continue ;;
+      *)      continue ;;
+    esac
+    state=$(_pane_input_state "$pane")
+    if [ "$state" != "empty" ]; then
+      log "$name: remote control $rc, but claude is $state; will retry later"
+      continue
+    fi
+    if _session_recently_active "$name" 120; then
+      log "$name: remote control $rc, but the session was just used; will retry later"
+      continue
+    fi
+    if [ "$dry" -eq 1 ]; then
+      log "$name: remote control $rc; would type /remote-control (dry run)"
+      continue
+    fi
+    log "$name: remote control $rc; typing /remote-control"
+    if ! _type_command "$pane" '/remote-control'; then
+      log "$name: could not get /remote-control into the prompt; will retry later"
+      continue
+    fi
+    sleep 3
+    if [ "$(_pane_prompt_typed "$pane")" = "/remote-control" ]; then
+      tmux send-keys -t "$pane" Enter
+    fi
+    if [ "$restart" -eq 1 ]; then
+      sleep 20
+      if [ "$(_pane_rc_state "$pane")" = "failed" ] && _pane_rc_needs_restart "$pane"; then
+        log "$name: claude asks for a restart before retrying; restarting the session"
+        _restart_session "$name" 0 || log "$name: restart failed"
+      fi
+    fi
+  done <<< "$rows"
+}
+
+cmd_keepalive() {
+  need tmux
+  local interval=300 once=0 dry=0 daemon=0 stop=0 status=0 restart=0 ensure=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval)   [ $# -ge 2 ] || die "--interval needs a value"; interval="$2"; shift ;;
+      --interval=*) interval="${1#*=}" ;;
+      --once)       once=1 ;;
+      --dry-run)    dry=1 ;;
+      --restart)    restart=1 ;;
+      --ensure)     ensure=1 ;;
+      -d|--daemon)  daemon=1 ;;
+      --stop)       stop=1 ;;
+      --status)     status=1 ;;
+      -h|--help)    help_for keepalive; return 0 ;;
+      *)            die "unknown option: $1 (try '$PROG help keepalive')" ;;
+    esac
+    shift
+  done
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 10 ] \
+    || die "--interval must be a number of seconds (10 or more)"
+
+  local pane
+  if [ "$stop" -eq 1 ]; then
+    if tmux kill-session -t "=$KEEPALIVE_SESSION" 2>/dev/null; then
+      printf 'stopped %s\n' "$KEEPALIVE_SESSION"
+    else
+      printf '%s is not running\n' "$KEEPALIVE_SESSION"
+    fi
+    return 0
+  fi
+
+  if [ "$status" -eq 1 ]; then
+    if ! tmux has-session -t "=$KEEPALIVE_SESSION" 2>/dev/null; then
+      printf '%s is not running (start it with: %s keepalive --daemon)\n' "$KEEPALIVE_SESSION" "$PROG"
+      return 0
+    fi
+    pane=$(tmux list-panes -t "=$KEEPALIVE_SESSION" -F '#{pane_id}' 2>/dev/null | head -n 1)
+    if _pane_dead "$pane"; then
+      printf '%s has stopped unexpectedly; last output:\n' "$KEEPALIVE_SESSION"
+    else
+      printf '%s is running (tmux session %s); recent log:\n' "$PROG keepalive" "$KEEPALIVE_SESSION"
+    fi
+    tmux capture-pane -p -J -t "$pane" -S -200 2>/dev/null | sed -e '/^[[:space:]]*$/d' | tail -n 15
+    return 0
+  fi
+
+  if [ "$daemon" -eq 1 ]; then
+    if tmux has-session -t "=$KEEPALIVE_SESSION" 2>/dev/null; then
+      pane=$(tmux list-panes -t "=$KEEPALIVE_SESSION" -F '#{pane_id}' 2>/dev/null | head -n 1)
+      if _pane_dead "$pane"; then
+        tmux kill-session -t "=$KEEPALIVE_SESSION" 2>/dev/null || true
+      else
+        printf '%s is already running (see: %s keepalive --status)\n' "$KEEPALIVE_SESSION" "$PROG"
+        return 0
+      fi
+    fi
+    local self
+    local -a opts=(keepalive --interval "$interval")
+    self=$(_self_path)
+    [ "$restart" -eq 1 ] && opts+=(--restart)
+    [ "$ensure" -eq 1 ]  && opts+=(--ensure)
+    [ "$dry" -eq 1 ]     && opts+=(--dry-run)
+    tmux new-session -d -s "$KEEPALIVE_SESSION" -c "$HOME" "$(_shell_join "$self" "${opts[@]}")"
+    # keep the pane if the loop ever dies, so --status can show why
+    pane=$(tmux list-panes -t "=$KEEPALIVE_SESSION" -F '#{pane_id}' 2>/dev/null | head -n 1)
+    [ -n "$pane" ] && _set_remain "$pane" on
+    printf 'started %s in tmux session %s (checking every %ss)\n' "$PROG keepalive" "$KEEPALIVE_SESSION" "$interval"
+    return 0
+  fi
+
+  log "keepalive started: every ${interval}s$( [ "$once" -eq 1 ] && printf ', once' )$( [ "$dry" -eq 1 ] && printf ', dry run' )$( [ "$restart" -eq 1 ] && printf ', restart allowed' )$( [ "$ensure" -eq 1 ] && printf ', ensure on' )"
+  while :; do
+    _keepalive_pass "$dry" "$restart" "$ensure" || log "check failed (exit $?)"
+    [ "$once" -eq 0 ] || break
+    sleep "$interval"
+  done
 }
 
 cmd_kill() {
@@ -307,19 +925,8 @@ cmd_kill() {
   fi
 
   [ ${#args[@]} -eq 0 ] && die "missing session name or # (try '$PROG help kill')"
-  local arg="${args[0]}"
-  local target=""
-  if [[ "$arg" =~ ^[0-9]+$ ]]; then
-    local rows; rows=$(_collect_sessions "here") || true
-    target=$(awk -F'\t' -v n="$arg" 'NR==n {print $1; exit}' <<< "$rows")
-    [ -z "$target" ] && die "no session #$arg in list (under $PWD)"
-  elif tmux has-session -t "=$arg" 2>/dev/null; then
-    target="$arg"
-  elif tmux has-session -t "=${SESSION_PREFIX}${arg}" 2>/dev/null; then
-    target="${SESSION_PREFIX}${arg}"
-  else
-    die "no session matches: $arg"
-  fi
+  local target
+  target=$(_resolve_session "${args[0]}")
   tmux kill-session -t "=$target"
   printf 'killed %s\n' "$target"
 }
@@ -373,12 +980,15 @@ main() {
   if [ $# -eq 0 ]; then usage; exit 0; fi
   local cmd="$1"; shift
   case "$cmd" in
-    list|ls)              cmd_list    "$@" ;;
-    new|start)            cmd_new     "$@" ;;
-    resume|attach|a)      cmd_resume  "$@" ;;
-    kill|stop)            cmd_kill    "$@" ;;
-    install)              cmd_install "$@" ;;
-    help|-h|--help)       help_for    "${1:-}" ;;
+    list|ls)              cmd_list      "$@" ;;
+    new|start)            cmd_new       "$@" ;;
+    resume|attach|a)      cmd_resume    "$@" ;;
+    update|upgrade)       cmd_update    "$@" ;;
+    restart)              cmd_restart   "$@" ;;
+    keepalive|watchdog)   cmd_keepalive "$@" ;;
+    kill|stop)            cmd_kill      "$@" ;;
+    install)              cmd_install   "$@" ;;
+    help|-h|--help)       help_for      "${1:-}" ;;
     version|-v|--version) cmd_version ;;
     *) die "unknown command: $cmd (try '$PROG help')" ;;
   esac
