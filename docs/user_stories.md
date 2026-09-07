@@ -19,6 +19,8 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 
 | ID | Story | Asked | Status |
 |----|-------|-------|--------|
+| [US-012](#us-012--keep-the-model-and-effort-level-a-session-was-using) | Keep the model and effort level a session was using | 2026-09-07 | Done |
+| [US-011](#us-011--unattended-maintenance-of-idle-sessions) | Unattended maintenance of idle sessions | 2026-09-07 | Done |
 | [US-010](#us-010--keep-a-master-record-of-user-stories) | Keep a master record of user stories | 2026-09-02 | Done |
 | [US-009](#us-009--keep-remote-control-alive-in-dormant-sessions) | Keep Remote Control alive in dormant sessions | 2026-09-02 | Done |
 | [US-008](#us-008--update-claude-in-place-without-losing-the-session) | Update Claude in place without losing the session | 2026-09-02 | Done |
@@ -31,6 +33,79 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 | [US-001](#us-001--start-a-new-claude-session-in-a-directory) | Start a new Claude session in a directory | 2026-08-27 | Done |
 
 ## Stories
+
+### US-012 — Keep the model and effort level a session was using
+
+- **Asked:** 2026-09-07, in conversation: "one thing that has been happening
+  with updates — the models and effort levels get reverted back to defaults.
+  Ensure whatever the last model and effort level the session had in use is
+  retained after an update."
+- **Story:** As a user who picks a model and an effort level per session, I
+  want a restarted session to come back on the same model and effort it was
+  using, so that an update does not silently drop me back to my global
+  defaults.
+- **Background:** `/model` writes the chosen model to `settings.json` as the
+  default for *new* sessions, and `/effort` is explicitly session-only
+  ("this session only"), so a plain `claude --resume <id>` starts on the
+  global default model and the built-in effort. Claude Code records what a
+  session actually ran in its transcript
+  (`~/.claude/projects/<dir>/<session-id>.jsonl`), and accepts `--model`,
+  `--effort` and `--settings '{"ultracode":true}'` on the command line.
+- **Acceptance criteria:**
+  - Before restarting a session, cmm works out the model and effort it was
+    last using and passes them to the new Claude, so the restarted session
+    reports the same model and effort as before.
+  - The model is taken from the session's own transcript (the last `/model`
+    the user ran, otherwise the model of the last assistant message) and is
+    restored as a family alias (`fable`, `opus`, `sonnet`, `haiku`) so it
+    keeps resolving to a model this Claude Code version knows.
+  - The effort level is taken from the last `/effort` in the transcript,
+    falling back to what cmm itself launched the session with; `ultracode` is
+    restored as `--settings '{"ultracode":true}'`, and `auto` restores
+    nothing.
+  - Explicit arguments after `--` still win over the restored ones, and if the
+    restarted Claude dies immediately, cmm retries once without the restored
+    flags rather than leaving the session down.
+  - `cmm list --model` shows the model and effort cmm would restore for each
+    session.
+- **Status:** Done
+- **Delivered in:** the 0.4.0 commit
+
+### US-011 — Unattended maintenance of idle sessions
+
+- **Asked:** 2026-09-07, in conversation: "I want to be able install a deamon
+  or cron job that safely maintains up-to-date claude sessions under this
+  manager, without interrupting active sessions (i.e. only touches idle
+  sessions and require an update or have /rc in failure mode). This should be
+  maximally cautious."
+- **Story:** As a user with several long-lived sessions, I want a background
+  service that keeps them on the current Claude Code version and keeps Remote
+  Control connected, without ever interrupting a session I am using, so that I
+  can leave sessions running for days and find them healthy.
+- **Acceptance criteria:**
+  - `cmm maintain` runs a maintenance pass over every `claude-*` session on the
+    host: sessions whose footer says "Update installed · Restart to apply" are
+    restarted in place (conversation, model and effort preserved), and
+    sessions showing `/rc failed` get `/remote-control` typed for them.
+  - A session is only touched when every check passes: Claude is idle at an
+    empty prompt (no dialog, no unsent text, not working), its screen has not
+    changed for a few seconds, no attached client has had keyboard activity
+    for `--idle` minutes (default 15), and cmm has not restarted it within
+    `--cooldown` minutes (default 60). Everything else is left for the next
+    pass.
+  - A pass restarts at most `--max` sessions (default 2) and stops restarting
+    after the first failure; `--dry-run` reports what a pass would do without
+    touching anything.
+  - Only one pass runs at a time on a host (a lock), so a service, a cron job
+    and a manual run cannot collide.
+  - `cmm maintain --install` installs the service — a systemd user timer where
+    available, otherwise a cron entry — so it survives logout and reboot;
+    `--uninstall` removes it and `--status` shows what is installed, when it
+    next runs, and the tail of its log.
+  - `cmm maintain --daemon` keeps the zero-setup option of running the loop in
+    a detached tmux session.
+- **Status:** Done
+- **Delivered in:** the 0.4.0 commit
 
 ### US-010 — Keep a master record of user stories
 

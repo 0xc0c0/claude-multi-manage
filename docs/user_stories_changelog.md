@@ -4,6 +4,21 @@ Every change to [user_stories.md](user_stories.md), newest first. One dated
 section per change; each bullet names the story IDs it touches and what
 changed (added, status, criteria, delivery).
 
+## 2026-09-07
+
+- Added US-011 (unattended maintenance of idle sessions) from the 2026-09-07
+  request for a daemon or cron job that only touches idle sessions needing an
+  update or showing `/rc failed`; **Done** in the 0.4.0 commit.
+- Added US-012 (keep the model and effort level a session was using) from the
+  2026-09-07 report that models and effort levels revert to defaults after an
+  update; **Done** in the 0.4.0 commit.
+- US-009: `cmm keepalive` became `cmm maintain` (old name kept as an alias) and
+  its default interval moved from 300 s to 900 s when US-011 folded updates
+  into the same pass.
+- US-008: restarts now suppress Claude's "resume from summary" prompt so a
+  resumed session always comes back with its full context, and restore the
+  session's model and effort (US-012).
+
 ## 2026-09-02
 
 - Created the record from a reverse-chronological review of the git history.
