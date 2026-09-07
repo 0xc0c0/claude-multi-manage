@@ -8,10 +8,10 @@ changed (added, status, criteria, delivery).
 
 - Added US-011 (unattended maintenance of idle sessions) from the 2026-09-07
   request for a daemon or cron job that only touches idle sessions needing an
-  update or showing `/rc failed`; **Done** in the 0.4.0 commit.
+  update or showing `/rc failed`; **Done** in 41378f5.
 - Added US-012 (keep the model and effort level a session was using) from the
   2026-09-07 report that models and effort levels revert to defaults after an
-  update; **Done** in the 0.4.0 commit.
+  update; **Done** in 41378f5.
 - US-009: `cmm keepalive` became `cmm maintain` (old name kept as an alias) and
   its default interval moved from 300 s to 900 s when US-011 folded updates
   into the same pass.

@@ -69,7 +69,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
   - `cmm list --model` shows the model and effort cmm would restore for each
     session.
 - **Status:** Done
-- **Delivered in:** the 0.4.0 commit
+- **Delivered in:** 41378f5
 
 ### US-011 — Unattended maintenance of idle sessions
 
@@ -105,7 +105,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
   - `cmm maintain --daemon` keeps the zero-setup option of running the loop in
     a detached tmux session.
 - **Status:** Done
-- **Delivered in:** the 0.4.0 commit
+- **Delivered in:** 41378f5
 
 ### US-010 — Keep a master record of user stories
 
