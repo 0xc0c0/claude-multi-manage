@@ -25,7 +25,8 @@ cmm resume [name|#]        # attach to an existing session (interactive if no ar
 cmm update [name|#]        # restart a session's claude on the latest version,
                            # keeping the conversation (--all, --pending)
 cmm restart [name|#]       # same as update, without running 'claude update'
-cmm keepalive --daemon     # keep Remote Control reconnected in idle sessions
+cmm maintain --install     # background service: apply waiting updates and
+                           # reconnect Remote Control, in idle sessions only
 cmm kill <name|#>          # kill a session; --all kills all under $PWD
 cmm help [command]         # full help for any subcommand
 ```
@@ -54,24 +55,58 @@ Sessions that are busy or have unsent text in the prompt are skipped unless
 you pass `--force`. `cmm list` shows `update-ready` next to sessions that need
 it. Run it from outside the Claude you are restarting.
 
-## Keeping Remote Control alive
+### The model and effort level come back too
 
-Claude Code retries a dropped Remote Control connection for about 30 minutes
-and then gives up, showing `/rc failed` in the footer until someone runs
-`/remote-control` in that session. Detached sessions that sit idle for hours
-therefore go stale after any network blip. `cmm keepalive` checks every
-`claude-*` session and types `/remote-control` into the ones that have failed
-while idle at an empty prompt.
+Claude does not carry either across a resume: `/model` saves your choice as the
+default for *new* sessions and `/effort` is explicitly session-only, so a plain
+`claude --resume` starts on your global defaults. Before restarting, `cmm` reads
+the session's own transcript to see which model it was replying with and which
+`/effort` you last set, and passes them to the new Claude
+(`--model opus --effort max`, or `--settings '{"ultracode":true}'` for
+ultracode). The model is restored as a family alias (`opus`, `fable`,
+`sonnet`, `haiku`) so an old session cannot come back on a version this Claude
+Code no longer knows, and anything you pass after `--` wins.
 
 ```bash
-cmm keepalive --once --dry-run   # see what it would do
-cmm keepalive --daemon           # run every 5 minutes in tmux session cmm-keepalive
-cmm keepalive --status           # is it running? recent log
-cmm keepalive --stop
+cmm list --model           # what each session would come back as
 ```
 
-`cmm list` shows the Remote Control state of each session (`rc:on`,
-`rc:failed`, `rc:off`).
+`cmm` also turns off Claude's "resume from summary" prompt for the restart, so
+the whole conversation comes back rather than a summary of it.
+
+## Background maintenance
+
+`cmm maintain` looks after sessions that sit idle for hours: it restarts the
+ones whose footer says `Update installed · Restart to apply` (bringing back
+their conversation, model and effort), and types `/remote-control` into the
+ones showing `/rc failed` — Claude Code retries a dropped Remote Control
+connection for about 30 minutes and then gives up until someone runs that
+command.
+
+It is deliberately timid. A session is only touched when Claude is idle at an
+empty prompt (not busy, nothing typed, no dialog open), its screen has not
+changed for a few seconds, no attached client has typed in it for `--idle`
+minutes (default 15), and `cmm` has not restarted it within `--cooldown`
+minutes (default 60). At most `--max` sessions (default 2) are restarted per
+pass, and a failure stops the rest. Everything skipped is simply looked at
+again next time, and only one pass runs at a time on a host.
+
+```bash
+cmm maintain --once --dry-run    # what a pass would do right now
+cmm maintain --install           # systemd user timer (or cron), every 15 min
+cmm maintain --install --cron --interval 1800 --ensure   # pick the details
+cmm maintain --status            # what is installed, when it runs, recent log
+cmm maintain --uninstall
+cmm maintain --daemon            # no-setup alternative: a loop in tmux
+```
+
+Unattended passes log to `~/.cache/cmm/maintain.log`. With systemd, run
+`loginctl enable-linger $USER` if you want it to keep running while you are
+logged out. `cmm keepalive` still works as an alias for this command.
+
+`cmm list` shows what each session is doing (`idle`, `busy`, `typing`,
+`dialog`), whether it is `update-ready`, and its Remote Control state
+(`rc:on`, `rc:failed`, `rc:off`).
 
 ## Requirements
 

@@ -10,9 +10,17 @@
 - single script: `cmm` (executable, `#!/usr/bin/env bash`, `set -euo pipefail`)
 - subcommands are `cmd_<name>` functions; per-command help lives in `help_for`
 - sessions are plain tmux sessions named `claude-<name>`
-- `update`/`restart`/`keepalive` read a session's screen with `tmux capture-pane`
+- `update`/`restart`/`maintain` read a session's screen with `tmux capture-pane`
   and drive it with `tmux send-keys`; they rely on strings Claude Code prints
-  (`Resume this session with:`, `/rc failed`, `Restart to apply`, `esc to interrupt`)
+  (`Resume this session with:`, `/rc failed`, `Restart to apply`, `esc to interrupt`),
+  on its transcripts under `~/.claude/projects/<dir>/<session-id>.jsonl` (for the
+  model and effort a session was using), and on `--model`, `--effort`,
+  `--settings` and `CLAUDE_CODE_RESUME_THRESHOLD_MINUTES`
+- a session's prompt is the `❯` line directly under the input box's top border,
+  near the bottom of the screen: earlier prompts stay on screen as history and
+  dialogs are drawn below them, so anchor on the border, never on the last `❯`
+- tmux `-F` output is sanitised without a UTF-8 locale (a tab separator becomes
+  `_` under cron), so `_collect_sessions` separates fields with `|`
 - no generated files; no tests yet — verify with `bash -n cmm` and manual runs
 
 ## Docs
@@ -25,9 +33,13 @@
 ## Local dev
 - run: `./cmm help`, `./cmm list --all`
 - syntax check: `bash -n cmm`
-- try `update`/`restart`/`keepalive` on a throwaway session in a scratch
+- try `update`/`restart`/`maintain` on a throwaway session in a scratch
   directory (`tmux new-session -d -s claude-selftest -c /tmp/x claude`), never
-  on a session you are working in
+  on a session you are working in; to exercise a maintenance pass, source the
+  script and override `_collect_sessions` / `_pane_update_ready` so the pass
+  only sees the throwaway one
+- also check a pass in a cron-like environment
+  (`env -i HOME=$HOME PATH=... cmm maintain --once --dry-run`)
 - install: `./cmm install` (to `~/.local/bin`) or `./cmm install --system`
 
 ## Notes for Claude
