@@ -19,6 +19,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 
 | ID | Story | Asked | Status |
 |----|-------|-------|--------|
+| [US-013](#us-013--pause-every-session-before-a-reboot-and-bring-them-back-afterwards) | Pause every session before a reboot and bring them back afterwards | 2026-09-13 | In progress |
 | [US-012](#us-012--keep-the-model-and-effort-level-a-session-was-using) | Keep the model and effort level a session was using | 2026-09-07 | Done |
 | [US-011](#us-011--unattended-maintenance-of-idle-sessions) | Unattended maintenance of idle sessions | 2026-09-07 | Done |
 | [US-010](#us-010--keep-a-master-record-of-user-stories) | Keep a master record of user stories | 2026-09-02 | Done |
@@ -33,6 +34,63 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 | [US-001](#us-001--start-a-new-claude-session-in-a-directory) | Start a new Claude session in a directory | 2026-08-27 | Done |
 
 ## Stories
+
+### US-013 — Pause every session before a reboot and bring them back afterwards
+
+- **Asked:** 2026-09-13, in conversation: "I need the `cmm` tool to be able to
+  gracefully pause all sessions in advance of a system reboot (e.g. kernel
+  update/security/etc.), and reload (again, gracefully) all sessions from
+  their contexts. I will likely only need to be able to run this from a master
+  location (like ~) where it's safe to assume all relevant sessions are
+  visible and nested underneath."
+- **Story:** As a user with many long-lived sessions on a host that has to be
+  rebooted, I want one command that shuts every session down cleanly and
+  remembers how to bring it back, and one command that brings them all back
+  afterwards, so that a kernel or security update does not cost me any
+  conversation, model choice, effort level or Remote Control connection.
+- **Background:** tmux sessions do not survive a reboot, so everything needed
+  to recreate a session has to be written somewhere durable before the host
+  goes down. Claude prints `Resume this session with: claude --resume <id>`
+  on a clean exit, which is what `cmm update` already relies on; the
+  transcript it leaves behind still says which model and effort the session
+  was using. Decisions taken when the story was asked: a session that is
+  still working is waited for and never interrupted (only `--force`
+  interrupts); unsent text in a prompt is saved and typed back on reload; the
+  reload is run by hand after the reboot, nothing is installed to run at boot.
+- **Acceptance criteria:**
+  - `cmm pause`, run from a directory such as `~`, pauses every `claude-*`
+    session whose working directory is at or under `$PWD` (`--all` for every
+    session on the host): it asks each Claude to exit cleanly, reads the
+    resume id from the exit hint, and records the session name, directory,
+    resume id, worktree, Remote Control state, model and effort level in a
+    manifest that survives the reboot.
+  - A session that is still working, showing a dialog or not yet at a prompt
+    is waited for, up to `--wait` minutes (default 10), and paused as soon as
+    it reaches an idle prompt. Anything still busy when the wait runs out is
+    left running and listed, and the command exits non-zero so the user
+    knows it is not yet safe to reboot. `--force` interrupts instead of
+    waiting.
+  - Unsent text in a session's prompt is saved with the session and typed
+    back into the prompt, unsubmitted, when the session is reloaded.
+  - `cmm pause` shows what it is about to do and asks for confirmation
+    (`--yes` skips it); `--dry-run` only reports. It holds the same lock as
+    `cmm maintain`, never touches the session it is itself running in, and
+    reports sessions outside `$PWD` rather than touching them. Pausing an
+    already paused session keeps the earlier manifest entry.
+  - `cmm reload` recreates every session in the manifest with its original
+    name and directory, resuming the same conversation with model, effort
+    and Remote Control restored (with the same fallback as `cmm restart`
+    when Claude refuses the restored flags). A tmux session that still
+    exists with Claude exited is reused in place, so a pause can be undone
+    without a reboot. Sessions that come back are removed from the manifest;
+    sessions that fail stay in it so a rerun retries only them.
+    `--list` shows what is paused, `--dry-run` reports without starting
+    anything.
+  - `cmm list` shows paused sessions as `paused` while their tmux session
+    still exists, and mentions a non-empty manifest so a forgotten reload is
+    noticed.
+- **Status:** In progress
+- **Delivered in:** —
 
 ### US-012 — Keep the model and effort level a session was using
 
