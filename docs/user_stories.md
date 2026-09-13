@@ -19,7 +19,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 
 | ID | Story | Asked | Status |
 |----|-------|-------|--------|
-| [US-013](#us-013--pause-every-session-before-a-reboot-and-bring-them-back-afterwards) | Pause every session before a reboot and bring them back afterwards | 2026-09-13 | In progress |
+| [US-013](#us-013--pause-every-session-before-a-reboot-and-bring-them-back-afterwards) | Pause every session before a reboot and bring them back afterwards | 2026-09-13 | Done |
 | [US-012](#us-012--keep-the-model-and-effort-level-a-session-was-using) | Keep the model and effort level a session was using | 2026-09-07 | Done |
 | [US-011](#us-011--unattended-maintenance-of-idle-sessions) | Unattended maintenance of idle sessions | 2026-09-07 | Done |
 | [US-010](#us-010--keep-a-master-record-of-user-stories) | Keep a master record of user stories | 2026-09-02 | Done |
@@ -89,8 +89,8 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
   - `cmm list` shows paused sessions as `paused` while their tmux session
     still exists, and mentions a non-empty manifest so a forgotten reload is
     noticed.
-- **Status:** In progress
-- **Delivered in:** —
+- **Status:** Done
+- **Delivered in:** 999fd7e
 
 ### US-012 — Keep the model and effort level a session was using
 

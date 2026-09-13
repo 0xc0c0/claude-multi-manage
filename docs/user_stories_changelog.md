@@ -9,7 +9,7 @@ changed (added, status, criteria, delivery).
 - Added US-013 (pause every session before a reboot and bring them back
   afterwards) from the 2026-09-13 request for a graceful pause of all
   sessions ahead of a system reboot and a graceful reload from their
-  contexts, run from a master location such as `~`; **In progress**.
+  contexts, run from a master location such as `~`; **Done** in 999fd7e.
   Decisions recorded with the story: busy sessions are waited for, never
   interrupted (only `--force` interrupts); unsent prompt text is saved and
   typed back on reload; reload is manual, nothing runs at boot.
