@@ -27,6 +27,9 @@ cmm update [name|#]        # restart a session's claude on the latest version,
 cmm restart [name|#]       # same as update, without running 'claude update'
 cmm maintain --install     # background service: apply waiting updates and
                            # reconnect Remote Control, in idle sessions only
+cmm pause                  # before a reboot: stop every session under $PWD
+                           # cleanly, remembering how to bring it back
+cmm reload                 # after the reboot: bring them all back
 cmm kill <name|#>          # kill a session; --all kills all under $PWD
 cmm help [command]         # full help for any subcommand
 ```
@@ -107,6 +110,40 @@ logged out. `cmm keepalive` still works as an alias for this command.
 `cmm list` shows what each session is doing (`idle`, `busy`, `typing`,
 `dialog`), whether it is `update-ready`, and its Remote Control state
 (`rc:on`, `rc:failed`, `rc:off`).
+
+## Rebooting the host
+
+tmux sessions do not survive a reboot, so before a kernel or security update
+run `cmm pause` from a directory above all your sessions (`~`, say). It asks
+each Claude to exit cleanly, reads the resume id from the exit hint, and
+writes what it needs to bring the session back (name, directory, resume id,
+worktree, Remote Control state, model, effort level, and any unsent text in
+the prompt) to a manifest under `~/.local/state/cmm/paused`. After the reboot,
+`cmm reload` recreates every session from that manifest with its original name
+and directory, resuming the same conversation with the same model, effort and
+Remote Control, and types any unsent text back in without submitting it.
+
+```bash
+cd ~ && cmm pause          # shows what it will do, then asks
+sudo reboot
+cd ~ && cmm reload         # everything comes back; prints 'cmm list'
+```
+
+A session that is still working, or waiting for an answer on screen, is
+waited for (`--wait`, default 10 minutes) and paused as soon as it is idle.
+It is never interrupted: anything still busy when the wait runs out is left
+running and listed, and `cmm pause` exits with status 1 so you know it is not
+yet safe to reboot (`--force` interrupts instead). `--all` takes every session
+on the host rather than those under `$PWD`, `--yes` skips the confirmation
+and `--dry-run` only reports.
+
+The tmux sessions are left in place with the exit hint on screen (`cmm list`
+shows them as `paused`), so if there is no reboot after all, `cmm reload`
+simply restarts Claude in them. Sessions that come back are removed from the
+manifest; any that could not be started stay in it, and `cmm reload` retries
+only those. `cmm reload --list` shows what is paused and `cmm list` mentions
+it, so a forgotten reload is noticed. The maintenance service needs no
+attention: it ignores paused sessions and picks the reloaded ones up again.
 
 ## Requirements
 
