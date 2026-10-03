@@ -4,6 +4,17 @@ Every change to [user_stories.md](user_stories.md), newest first. One dated
 section per change; each bullet names the story IDs it touches and what
 changed (added, status, criteria, delivery).
 
+## 2026-10-03
+
+- US-013: corrected after a stale manifest entry was reported on 2026-09-29.
+  A session whose Claude had already exited was recorded without a directory
+  (a dead tmux pane reports none), so `cmm reload` could never recreate it
+  and only said that its directory did not exist. Pause now falls back to
+  the tmux session's start directory and then the transcript's working
+  directory, reload recovers a missing directory from the transcript, and
+  entries that cannot be brought back are listed with the `--forget` command
+  that drops them. **In progress**.
+
 ## 2026-09-13
 
 - Added US-013 (pause every session before a reboot and bring them back

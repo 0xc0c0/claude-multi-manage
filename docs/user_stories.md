@@ -86,6 +86,16 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
     sessions that fail stay in it so a rerun retries only them.
     `--list` shows what is paused, `--dry-run` reports without starting
     anything.
+  - A session whose Claude had already exited when `cmm pause` ran is
+    recorded with the directory its tmux session started in, or the one in
+    its transcript, and is not recorded at all when neither is known. (A
+    dead tmux pane reports no working directory, so until 0.5.1 such an
+    entry had an empty directory and could never be reloaded.)
+  - `cmm reload` falls back to the directory in the transcript when the
+    recorded one is missing. An entry it can never start (no directory, or
+    something else already running under that name) is reported separately
+    from entries worth retrying, each with the `cmm reload --forget NAME`
+    that drops it, and `--list` flags such entries.
   - `cmm list` shows paused sessions as `paused` while their tmux session
     still exists, and mentions a non-empty manifest so a forgotten reload is
     noticed.
