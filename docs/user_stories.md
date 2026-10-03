@@ -100,7 +100,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
     still exists, and mentions a non-empty manifest so a forgotten reload is
     noticed.
 - **Status:** Done
-- **Delivered in:** 999fd7e
+- **Delivered in:** 999fd7e; the exited-session correction in ec796a5
 
 ### US-012 — Keep the model and effort level a session was using
 

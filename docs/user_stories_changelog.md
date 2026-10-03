@@ -13,7 +13,7 @@ changed (added, status, criteria, delivery).
   the tmux session's start directory and then the transcript's working
   directory, reload recovers a missing directory from the transcript, and
   entries that cannot be brought back are listed with the `--forget` command
-  that drops them. **In progress**.
+  that drops them. **Done** in ec796a5.
 
 ## 2026-09-13
 
