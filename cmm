@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 PROG="$(basename "${0}")"
 SESSION_PREFIX="claude-"
 MAINT_SESSION="cmm-maintain"
@@ -373,6 +373,16 @@ _transcript_for() {
     if [ -f "$d$id.jsonl" ]; then printf '%s\n' "$d$id.jsonl"; return 0; fi
   done
   return 0
+}
+
+# The directory a conversation ran in, from its transcript: every entry
+# carries a "cwd", and the last one wins.
+_transcript_cwd() {
+  local f
+  f=$(_transcript_for "$1")
+  [ -n "$f" ] || return 0
+  LC_ALL=C grep -o '"cwd":"[^"]*"' "$f" 2>/dev/null | tail -n 1 \
+    | sed -e 's/^"cwd":"//' -e 's/"$//' || true
 }
 
 # The conversation a *running* session is in, without disturbing it: the id
@@ -1013,6 +1023,11 @@ a pause can be undone without a reboot; one already running the same
 conversation is left alone. Sessions that come back are removed from the
 manifest, those that could not be started stay in it, so running
 '$PROG reload' again retries only them. \$PWD does not matter.
+
+If the recorded directory is missing, the one in the session's transcript
+is used instead. An entry that cannot be brought back at all (no directory
+anywhere, or something else already running under that name) is listed
+with the '$PROG reload --forget NAME' that drops it.
 
 Options:
   -n, --dry-run  list what would be started and start nothing
@@ -1795,8 +1810,13 @@ _type_text() {
 # $2 = 1 to interrupt a busy claude or dismiss a dialog. Returns 1 if the
 # session was left running, 2 if it is not ready (busy, showing a dialog, not
 # at a prompt) and should be looked at again; the caller decides how long.
+# Pause one session: stop its claude cleanly and write the manifest entry.
+# $2 = 1 to interrupt a busy claude or dismiss a dialog. Returns 1 if the
+# session was left running, 2 if it is not ready (busy, showing a dialog, not
+# at a prompt) and should be looked at again, 3 if nothing is running in it
+# but it could not be recorded; the caller decides how long to wait.
 _pause_session() {
-  local name="$1" force="$2" pane state="" text file how
+  local name="$1" force="$2" pane state="" text file how dir
   pane=$(_claude_pane "$name")
   [ -n "$pane" ] || { warn "$name: no pane found; left alone"; return 1; }
   if [ "${TMUX_PANE:-}" = "$pane" ]; then
@@ -1805,7 +1825,10 @@ _pause_session() {
   fi
   file=$(_pause_file "$name")
   P_name="$name"; P_typed=""; P_session=""; P_worktree=""; P_model=""; P_effort=""
+  # A pane whose claude has died reports no current path; the directory the
+  # tmux session was started in is the next best thing.
   P_path=$(_pane_fmt "$pane" '#{pane_current_path}')
+  [ -n "$P_path" ] || P_path=$(_pane_fmt "$pane" '#{session_path}')
   P_rc=$(_pane_rc_state "$pane")
 
   if _pane_dead "$pane"; then
@@ -1847,6 +1870,17 @@ _pause_session() {
       how="no conversation to resume; will start a new one, "
     fi
   fi
+  # Still no directory to come back in: the transcript knows where it ran.
+  if [ -z "$P_path" ] || [ ! -d "$P_path" ]; then
+    dir=$(_transcript_cwd "$P_session")
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      P_path="$dir"
+    else
+      printf 'not recorded\n'
+      warn "$name: no directory is known for it${P_path:+ ($P_path is gone)}, so it could not be brought back; nothing was written"
+      return 3
+    fi
+  fi
   { read -r P_model; read -r P_effort; } < <(_restore_pick "$name" "$P_session")
   _pause_write "$name"
   printf 'paused (%s%s%s)\n' "$how" "$(_kept_summary "$P_model" "$P_effort")" \
@@ -1855,13 +1889,30 @@ _pause_session() {
 
 # Bring one paused session back from manifest file $1. Returns 1 if it could
 # not be started; the file is kept then, for another try.
+# Bring one paused session back from manifest file $1. Returns 1 if it could
+# not be started and is worth another try, 2 if it cannot be brought back as
+# it is and needs a decision (no directory to start it in, or something else
+# already running under that name). The file is kept in both cases.
 _reload_session() {
-  local file="$1" name pane cur
-  _pause_read "$file" || { warn "unreadable manifest $file; skipped"; return 1; }
+  local file="$1" name pane cur dir why
+  if ! _pause_read "$file"; then
+    P_name="${file##*/}"
+    warn "$P_name: unreadable manifest $file ('$PROG reload --forget $P_name' drops it)"
+    return 2
+  fi
   name="$P_name"
-  if [ ! -d "$P_path" ]; then
-    warn "$name: its directory $P_path does not exist; left in the manifest"
-    return 1
+  if [ -z "$P_path" ] || [ ! -d "$P_path" ]; then
+    # Not recorded (a pane whose claude had died reports no directory) or
+    # gone since; the transcript says where the conversation ran.
+    if [ -n "$P_path" ]; then why="its directory $P_path is gone"; else why="no directory was recorded for it"; fi
+    dir=$(_transcript_cwd "$P_session")
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+      printf '%s: %s; using %s from its transcript\n' "$name" "$why" "$dir"
+      P_path="$dir"
+    else
+      warn "$name: $why and its transcript does not say where it ran; it cannot be brought back ('$PROG reload --forget $name' drops it)"
+      return 2
+    fi
   fi
   if tmux has-session -t "=$name" 2>/dev/null; then
     pane=$(_claude_pane "$name")
@@ -1874,11 +1925,11 @@ _reload_session() {
             rm -f "$file"
             return 0
           fi
-          warn "$name: a claude is already running there, maybe on another conversation; left in the manifest ('$PROG reload --forget $name' drops it)"
-          return 1 ;;
+          warn "$name: a claude is already running there, maybe on another conversation; kill it first, or '$PROG reload --forget $name' drops the entry"
+          return 2 ;;
         *)
-          warn "$name: its tmux session exists and is running '$cur'; left in the manifest"
-          return 1 ;;
+          warn "$name: its tmux session exists and is running '$cur'; kill it first, or '$PROG reload --forget $name' drops the entry"
+          return 2 ;;
       esac
     fi
     printf '%s: tmux session still there; ' "$name"
@@ -1903,15 +1954,26 @@ _reload_session() {
 }
 
 # What is paused right now, as a table.
+# What is paused right now, as a table.
 _pause_list() {
-  local f w
+  local f w where
   w=$(_pause_files | awk -F/ '{ if (length($NF) > m) m = length($NF) } END { print (m > 4 ? m : 4) }')
   printf "%-${w}s  %-8s  %-36s  %-18s  %s\n" 'NAME' 'PAUSED' 'CONVERSATION' 'MODEL/EFFORT' 'PATH'
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    _pause_read "$f" || continue
+    if ! _pause_read "$f"; then
+      printf "%-${w}s  %s\n" "${f##*/}" "(unreadable manifest; $PROG reload --forget ${f##*/})"
+      continue
+    fi
+    if [ -z "$P_path" ]; then
+      where="(no directory recorded)"
+    elif [ ! -d "$P_path" ]; then
+      where="$P_path (missing)"
+    else
+      where="$P_path"
+    fi
     printf "%-${w}s  %-8s  %-36s  %-18s  %s%s\n" "$P_name" "$(_human_age "${P_paused:-0}")" \
-      "${P_session:-(new)}" "$(_kept_summary "$P_model" "$P_effort")" "$P_path" \
+      "${P_session:-(new)}" "$(_kept_summary "$P_model" "$P_effort")" "$where" \
       "$( [ -z "$P_typed" ] || printf '  (unsent text saved)' )"
   done < <(_pause_files)
 }
@@ -1928,7 +1990,7 @@ cmd_pause() {
   need tmux
   local scope="here" force=0 yes=0 dry=0 wait_mins=10 where
   local rows name _rest pane state n now deadline first=1 elsewhere=0 paused=0 rc ans w
-  local -a targets=() todo=() later=() left=()
+  local -a targets=() todo=() later=() left=() unrecorded=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --all)        scope="all" ;;
@@ -1973,7 +2035,7 @@ cmd_pause() {
       exited)   if [ -f "$(_pause_file "$n")" ]; then
                   printf "  %-${w}s  paused     already paused\n" "$n"
                 else
-                  printf "  %-${w}s  exited     claude already gone; its exit hint will be read\n" "$n"
+                  printf "  %-${w}s  exited     claude already gone; will be recorded from its exit hint\n" "$n"
                 fi ;;
       "this one") printf "  %-${w}s  this one   cannot pause the session this command runs in\n" "$n" ;;
       *)        if [ "$force" -eq 1 ]; then
@@ -2026,6 +2088,7 @@ cmd_pause() {
       case "$rc" in
         0) paused=$(( paused + 1 )) ;;
         2) later+=("$n") ;;
+        3) unrecorded+=("$n") ;;
         *) left+=("$n") ;;
       esac
     done
@@ -2051,12 +2114,16 @@ cmd_pause() {
   done
 
   printf '\n'
+  if [ ${#unrecorded[@]} -gt 0 ]; then
+    printf '%d session(s) had no claude running and could not be recorded; they will not come back: %s\n' \
+      "${#unrecorded[@]}" "${unrecorded[*]}"
+  fi
   if [ ${#left[@]} -gt 0 ]; then
     printf '%d of %d session(s) paused; %d left running: %s\n' "$paused" "${#targets[@]}" "${#left[@]}" "${left[*]}"
     printf 'not safe to reboot yet; run "%s pause" again once they are idle\n' "$PROG"
     return 1
   fi
-  printf 'all %d session(s) %s paused; after the reboot run: %s reload\n' "${#targets[@]}" "$where" "$PROG"
+  printf '%d session(s) %s paused, nothing left running; after the reboot run: %s reload\n' "$paused" "$where" "$PROG"
   if [ "$elsewhere" -gt 0 ]; then
     printf 'note: %d session(s) outside %s are still running\n' "$elsewhere" "$PWD"
   fi
@@ -2064,8 +2131,8 @@ cmd_pause() {
 
 cmd_reload() {
   need tmux
-  local dry=0 list=0 f n ok=0 failed=0 cmdline pane
-  local -a files=() forget=()
+  local dry=0 list=0 f n ok=0 failed=0 rc cmdline pane
+  local -a files=() forget=() stuck=()
   while [ $# -gt 0 ]; do
     case "$1" in
       -n|--dry-run)       dry=1 ;;
@@ -2111,7 +2178,12 @@ cmd_reload() {
   fi
 
   for f in "${files[@]}"; do
-    if _reload_session "$f"; then ok=$(( ok + 1 )); else failed=$(( failed + 1 )); fi
+    rc=0; _reload_session "$f" || rc=$?
+    case "$rc" in
+      0) ok=$(( ok + 1 )) ;;
+      2) stuck+=("${P_name:-${f##*/}}") ;;
+      *) failed=$(( failed + 1 )) ;;
+    esac
   done
 
   if [ -f "$PAUSE_DIR/daemon" ]; then
@@ -2135,10 +2207,14 @@ cmd_reload() {
     if [ "$failed" -gt 0 ]; then
       printf '%d could not be started and stay in the manifest; run "%s reload" again to retry them\n' "$failed" "$PROG"
     fi
+    if [ ${#stuck[@]} -gt 0 ]; then
+      printf '%d cannot be brought back as things stand: %s\n' "${#stuck[@]}" "${stuck[*]}"
+      printf 'see the warnings above; "%s reload --forget NAME" drops an entry for good\n' "$PROG"
+    fi
     printf '\n'
     cmd_list --all
   fi
-  [ "$failed" -eq 0 ]
+  [ "$failed" -eq 0 ] && [ ${#stuck[@]} -eq 0 ]
 }
 
 cmd_kill() {

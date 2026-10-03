@@ -145,6 +145,12 @@ only those. `cmm reload --list` shows what is paused and `cmm list` mentions
 it, so a forgotten reload is noticed. The maintenance service needs no
 attention: it ignores paused sessions and picks the reloaded ones up again.
 
+If a recorded directory is missing, `cmm reload` uses the one in the
+session's transcript. An entry that cannot be brought back at all (its
+directory is gone and the transcript does not say where it ran, or something
+else is already running under that name) is listed with the
+`cmm reload --forget NAME` that drops it.
+
 ## Requirements
 
 - `bash`, `tmux`, and `claude` on `PATH`.
