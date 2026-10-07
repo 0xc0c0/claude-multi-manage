@@ -19,7 +19,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 
 | ID | Story | Asked | Status |
 |----|-------|-------|--------|
-| [US-014](#us-014--restarts-that-survive-claude-codes-own-updates-and-background-work) | Restarts that survive Claude Code's own updates and background work | 2026-10-07 | In progress |
+| [US-014](#us-014--restarts-that-survive-claude-codes-own-updates-and-background-work) | Restarts that survive Claude Code's own updates and background work | 2026-10-07 | Done |
 | [US-013](#us-013--pause-every-session-before-a-reboot-and-bring-them-back-afterwards) | Pause every session before a reboot and bring them back afterwards | 2026-09-13 | Done |
 | [US-012](#us-012--keep-the-model-and-effort-level-a-session-was-using) | Keep the model and effort level a session was using | 2026-09-07 | Done |
 | [US-011](#us-011--unattended-maintenance-of-idle-sessions) | Unattended maintenance of idle sessions | 2026-09-07 | Done |
@@ -101,8 +101,8 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
     the input box rather than on the bottom of the screen.
   - cmm asks Claude Code (`claude agents --json`) which conversation a
     running session is in, and uses that when Claude prints no resume hint.
-- **Status:** In progress
-- **Delivered in:** —
+- **Status:** Done
+- **Delivered in:** fcaeae7
 
 ### US-013 — Pause every session before a reboot and bring them back afterwards
 

@@ -11,7 +11,8 @@ changed (added, status, criteria, delivery).
   longer worked and that sessions showed `exited` almost daily. Root causes
   recorded with the story: restarts landing while Claude Code's npm updater
   had `claude` replaced by a placeholder, and background work (subagents,
-  background shells) that the screen does not show as busy. **In progress.**
+  background shells) that the screen does not show as busy. **Done** in
+  fcaeae7.
 - US-008, US-011, US-013: criteria now defer to US-014 for background work
   (never interrupted by `update`/`restart`/`maintain`, waited for by
   `pause`), for the check that Claude Code is not mid-install, and for
