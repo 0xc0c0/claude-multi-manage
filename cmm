@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.5.1"
+VERSION="0.6.0"
 PROG="$(basename "${0}")"
 SESSION_PREFIX="claude-"
 MAINT_SESSION="cmm-maintain"
@@ -20,6 +20,11 @@ CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 # block an unattended restart and throw away the context cmm is preserving.
 # Its threshold is an env var, so a big one turns the prompt off.
 RESUME_PROMPT_OFF="CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=999999999"
+# How long to wait for Claude Code to finish installing an update before
+# starting a claude (seconds).
+INSTALL_WAIT="${CMM_INSTALL_WAIT:-300}"
+# How many maintenance passes try to bring back a session whose restart failed.
+RETRY_MAX=3
 
 # ---------- helpers ----------
 
@@ -191,6 +196,41 @@ _claude_pane() {
 _pane_fmt()    { tmux display-message -p -t "$1" "$2" 2>/dev/null || true; }
 _pane_dead()   { [ "$(_pane_fmt "$1" '#{pane_dead}')" = "1" ]; }
 
+# What Claude Code itself reports for the claude in pane $1, as
+# "STATUS|SESSION-ID", or nothing when it cannot tell. STATUS is "idle" or
+# "busy"; unlike the screen, Claude Code counts background work (subagents,
+# background shells) as busy. 'claude agents --json' lists every running
+# session by process id; while claude cannot run (an update is being
+# installed) the session's own entry under ~/.claude/sessions is read instead.
+_pane_claude_info() {
+  local pid out="" f st id
+  pid=$(_pane_fmt "$1" '#{pane_pid}')
+  case "$pid" in ""|*[!0-9]*) return 0 ;; esac
+  out=$(claude agents --json 2>/dev/null | LC_ALL=C awk -v want="$pid" '
+    BEGIN { RS = "}" }
+    function field(k,   v) {
+      if (!match($0, "\"" k "\":[[:space:]]*\"[^\"]*\"")) return ""
+      v = substr($0, RSTART, RLENGTH); sub(/^"[^"]*":[[:space:]]*"/, "", v); sub(/"$/, "", v)
+      return v
+    }
+    match($0, /"pid":[[:space:]]*[0-9]+/) {
+      v = substr($0, RSTART, RLENGTH); sub(/^"pid":[[:space:]]*/, "", v)
+      if (v == want) found = field("status") "|" field("sessionId")
+    }
+    END { if (found != "") print found }') || out=""
+  if [ -z "$out" ]; then
+    f="$CLAUDE_DIR/sessions/$pid.json"
+    [ -f "$f" ] || return 0
+    st=$(LC_ALL=C grep -o '"status":"[^"]*"' "$f" 2>/dev/null | head -n 1 | sed -e 's/^"status":"//' -e 's/"$//') || st=""
+    id=$(LC_ALL=C grep -o '"sessionId":"[^"]*"' "$f" 2>/dev/null | head -n 1 | sed -e 's/^"sessionId":"//' -e 's/"$//') || id=""
+    case "$st" in ""|idle) ;; *) st="busy" ;; esac   # the file has finer words for busy ("shell", ...)
+    out="$st|$id"
+  fi
+  printf '%s\n' "$out"
+}
+_pane_claude_status()  { _pane_claude_info "$1" | cut -d'|' -f1; }
+_pane_claude_session() { _pane_claude_info "$1" | cut -d'|' -f2; }
+
 # Visible text of a pane, wrapped lines joined and trailing blank lines dropped
 # (a detached pane can be taller than the screen claude last drew).
 _pane_text() {
@@ -198,17 +238,57 @@ _pane_text() {
     | awk '{ l[NR] = $0; if ($0 ~ /[^[:space:]]/) last = NR }
            END { for (i = 1; i <= last; i++) print l[i] }' || true
 }
-_pane_footer() { _pane_text "$1" | tail -n 10; }
 
-# What claude in a pane is doing, judged from its screen:
-#   busy    working on a turn ("esc to interrupt" in the footer)
-#   empty   idle at an empty prompt
-#   typing  idle, but there is unsent text in the prompt
-#   dialog  waiting for an answer (trust prompt, resume prompt, /effort, ...)
-#   none    no prompt visible (still starting, not claude, ...)
+# How many lines up from the bottom of the screen to look for claude's input
+# box: the list of running agents is drawn below it, a line per agent.
+BOX_SCAN=30
+
+# The lines below claude's input box: the footer (mode, "esc to interrupt",
+# the update notice, Remote Control) and, under it, the list of running
+# agents. With no input box on screen, the last 10 lines.
+_pane_footer() {
+  _pane_text "$1" | awk -v scan="$BOX_SCAN" '
+    { l[NR] = $0 }
+    END {
+      for (i = NR; i > 0 && i > NR - scan; i--)
+        if (l[i] ~ /^❯/ && i > 1 && l[i-1] ~ /^[[:space:]]*─/) { box = i; break }
+      if (box) {
+        for (from = box + 1; from <= NR && l[from] !~ /^[[:space:]]*─/; from++) ;
+        from++
+      } else from = NR - 9
+      for (i = (from > 1 ? from : 1); i <= NR; i++) print l[i]
+    }'
+}
+
+# What claude in a pane is doing, judged from its screen and from what
+# Claude Code reports for it:
+#   busy     working on a turn ("esc to interrupt" in the footer)
+#   bg-work  at its prompt, but subagents or background shells are running
+#   empty    idle at an empty prompt
+#   typing   idle, but there is unsent text in the prompt
+#   dialog   waiting for an answer (trust prompt, resume prompt, /effort, ...)
+#   none     no prompt visible (still starting, not claude, ...)
 _pane_input_state() {
+  local state
   case "$(_pane_footer "$1")" in *"esc to interrupt"*) printf 'busy\n'; return ;; esac
-  _pane_prompt_scan "$1" | cut -f1
+  state=$(_pane_prompt_scan "$1" | cut -f1)
+  case "$state" in
+    empty|typing)
+      case "$(_pane_claude_status "$1")" in ""|idle) ;; *) state="bg-work" ;; esac ;;
+  esac
+  printf '%s\n' "$state"
+}
+
+# How a state from _pane_input_state reads in a sentence ("claude is ...").
+_state_words() {
+  case "$1" in
+    busy)    printf 'working\n' ;;
+    bg-work) printf 'running background work (subagents or background shells)\n' ;;
+    typing)  printf 'holding unsent text in its prompt\n' ;;
+    dialog)  printf 'waiting for an answer on screen\n' ;;
+    empty)   printf 'idle\n' ;;
+    *)       printf 'not at a prompt\n' ;;
+  esac
 }
 
 # The text a person has typed into the prompt (trimmed; empty if none).
@@ -219,16 +299,18 @@ _pane_prompt_typed() {
 # Read the input box with its colour codes and print "STATE<TAB>TYPED".
 #
 # The input box is a line starting with the prompt marker that sits directly
-# under the box's top border, near the bottom of the screen. Both tests
-# matter: claude leaves earlier prompts on screen as history, and a dialog
-# (trust prompt, "resume from summary", a picker) is drawn *below* them, so
-# picking the last marker line anywhere on screen reads a stale prompt and
-# calls a session idle while it is really waiting for an answer.
+# under the box's top border, near the bottom of the screen (only the footer
+# and the list of running agents come after it). Both tests matter: claude
+# leaves earlier prompts on screen as history, and a dialog (trust prompt,
+# "resume from summary", a picker) is drawn *below* them, so picking the last
+# marker line anywhere on screen reads a stale prompt and calls a session
+# idle while it is really waiting for an answer.
 #
 # Placeholder hints and prompt suggestions are drawn dim (SGR 2); text the
 # user typed is not, so only non-dim text counts as typed.
 _pane_prompt_scan() {
-  { tmux capture-pane -p -e -J -t "$1" 2>/dev/null || true; } | LC_ALL=C awk -v nb="$(printf '\302\240')" '
+  { tmux capture-pane -p -e -J -t "$1" 2>/dev/null || true; } \
+    | LC_ALL=C awk -v nb="$(printf '\302\240')" -v scan="$BOX_SCAN" '
     {
       plain = $0; gsub(/\033\[[0-9;]*m/, "", plain)
       lines[NR] = $0; text[NR] = plain
@@ -236,7 +318,7 @@ _pane_prompt_scan() {
     }
     END {
       raw = ""
-      for (i = last; i > 0 && i > last - 12; i--) {
+      for (i = last; i > 0 && i > last - scan; i--) {
         if (text[i] ~ /^❯/ && i > 1 && text[i-1] ~ /^[[:space:]]*─/) { raw = lines[i]; break }
       }
       if (raw == "") {
@@ -343,11 +425,12 @@ _pane_tags() {
   [ -n "$pane" ] || { printf '?\n'; return; }
   if _pane_dead "$pane"; then printf 'exited\n'; return; fi
   case "$(_pane_input_state "$pane")" in
-    busy)   tags="busy" ;;
-    typing) tags="typing" ;;
-    empty)  tags="idle" ;;
-    dialog) tags="dialog" ;;
-    *)      tags="no-prompt" ;;
+    busy)    tags="busy" ;;
+    bg-work) tags="bg-work" ;;
+    typing)  tags="typing" ;;
+    empty)   tags="idle" ;;
+    dialog)  tags="dialog" ;;
+    *)       tags="no-prompt" ;;
   esac
   if _pane_update_ready "$pane"; then tags="$tags,update-ready"; fi
   rc=$(_pane_rc_state "$pane")
@@ -361,9 +444,11 @@ _pane_tags() {
 # ---------- what a session was running ----------
 # Restarting a session must not change the model or the effort level it was
 # using. Claude does not carry either across a resume: /model saves the choice
-# as the default for *new* sessions and /effort is explicitly session-only, so
-# 'claude --resume' comes up on the global defaults. What a session was really
-# running is in its transcript, and --model/--effort/--settings put it back.
+# as the default for *new* sessions, and /effort either stays with the session
+# ('max') or becomes the default for new sessions on that model, so
+# 'claude --resume' comes up on whatever the defaults are by then, which
+# other sessions keep changing. What a session was really running is in its
+# transcript, and --model/--effort/--settings put it back.
 
 # The transcript of a session id: $CLAUDE_DIR/projects/<dir>/<id>.jsonl
 _transcript_for() {
@@ -385,10 +470,16 @@ _transcript_cwd() {
     | sed -e 's/^"cwd":"//' -e 's/"$//' || true
 }
 
-# The conversation a *running* session is in, without disturbing it: the id
-# cmm resumed it with, or else the newest transcript for its directory.
+# The conversation a *running* session is in, without disturbing it: what
+# Claude Code reports for it, else the id cmm resumed it with, else the
+# newest transcript for its directory.
 _session_id() {
-  local name="$1" path="$2" maxage="${3:-}" id dir f
+  local name="$1" path="$2" maxage="${3:-}" id dir f pane
+  pane=$(_claude_pane "$name")
+  if [ -n "$pane" ] && ! _pane_dead "$pane"; then
+    id=$(_pane_claude_session "$pane")
+    if [ -n "$id" ]; then printf '%s\n' "$id"; return 0; fi
+  fi
   id=$(_sess_get "$name" @cmm_session)
   if [ -n "$id" ]; then printf '%s\n' "$id"; return 0; fi
   [ "$maxage" != "0" ] || return 0            # 0: trust nothing but cmm's own note
@@ -563,6 +654,108 @@ _restore_summary() {
   _kept_summary "$model" "$effort"
 }
 
+# ---------- Claude Code itself ----------
+# Claude Code updates itself in the background. On an npm install its updater
+# moves 'claude' aside and runs 'npm install -g'; until the new native binary
+# is in place, 'claude' is missing or a placeholder that prints "claude native
+# binary not installed" and exits. A claude started then dies at once, so cmm
+# stops nothing, and starts nothing, unless a new claude can start right now.
+
+# True if no updater holds Claude Code's update lock (Claude Code itself takes
+# a lock older than five minutes to be stale) and 'claude --version' answers.
+_claude_ready() {
+  local f t
+  for f in "$CLAUDE_DIR/.update.lock" "$CLAUDE_DIR/state/update-lock"; do
+    [ -e "$f" ] || continue
+    t=$(date -r "$f" +%s 2>/dev/null) || t=0
+    [ $(( $(date +%s) - t )) -ge 300 ] || return 1
+  done
+  case "$(claude --version 2>/dev/null)" in [0-9]*) return 0 ;; esac
+  return 1
+}
+
+# Wait up to $1 seconds for _claude_ready; false if it never was.
+_claude_wait_ready() {
+  local wait="${1:-$INSTALL_WAIT}" i=0
+  until _claude_ready; do
+    [ "$i" -lt "$wait" ] || return 1
+    sleep 5; i=$(( i + 5 ))
+  done
+}
+
+# The same for a command run by hand: say why it waits, and die with $1 (what
+# was not done) if a new claude still cannot start.
+_await_claude() {
+  _claude_ready && return 0
+  printf 'Claude Code is being installed or updated; waiting up to %s for it...\n' "$(_secs_words "$INSTALL_WAIT")"
+  _claude_wait_ready "$INSTALL_WAIT" \
+    || die "a new claude still cannot start ('claude --version' fails, or an update holds Claude Code's lock); $1"
+}
+
+# "5m" for 300 seconds, "45s" for 45.
+_secs_words() {
+  if [ "$1" -ge 60 ] && [ $(( $1 % 60 )) -eq 0 ]; then printf '%dm' $(( $1 / 60 )); else printf '%ds' "$1"; fi
+}
+
+# ---------- restarts that did not come back ----------
+# When a restarted claude will not start, the tmux session keeps a note of
+# what was being brought back, so the next maintenance pass, 'cmm restart' or
+# 'cmm pause' can carry on from there instead of losing the conversation.
+
+_pending_set() {   # name which worktree rc model effort path
+  local tries
+  tries=$(_sess_get "$1" @cmm_p_tries)
+  case "$tries" in ''|*[!0-9]*) tries=0 ;; esac
+  _sess_set "$1" @cmm_pending  "$(date +%s)"
+  _sess_set "$1" @cmm_p_tries  "$(( tries + 1 ))"
+  _sess_set "$1" @cmm_p_which  "$2"
+  _sess_set "$1" @cmm_p_wt     "$3"
+  _sess_set "$1" @cmm_p_rc     "$4"
+  _sess_set "$1" @cmm_p_model  "$5"
+  _sess_set "$1" @cmm_p_effort "$6"
+  _sess_set "$1" @cmm_p_path   "$7"
+}
+
+# Read the note on session $1 into PN_which, PN_wt, PN_rc, PN_model,
+# PN_effort, PN_path and PN_tries; false if there is none.
+_pending_get() {
+  [ -n "$(_sess_get "$1" @cmm_pending)" ] || return 1
+  PN_which=$(_sess_get "$1" @cmm_p_which);   PN_wt=$(_sess_get "$1" @cmm_p_wt)
+  PN_rc=$(_sess_get "$1" @cmm_p_rc);         PN_model=$(_sess_get "$1" @cmm_p_model)
+  PN_effort=$(_sess_get "$1" @cmm_p_effort); PN_path=$(_sess_get "$1" @cmm_p_path)
+  PN_tries=$(_sess_get "$1" @cmm_p_tries)
+  case "$PN_tries" in ''|*[!0-9]*) PN_tries=0 ;; esac
+  [ -n "$PN_rc" ] || PN_rc="off"
+}
+
+_pending_clear() {
+  local o
+  for o in @cmm_pending @cmm_p_tries @cmm_p_which @cmm_p_wt @cmm_p_rc \
+           @cmm_p_model @cmm_p_effort @cmm_p_path; do
+    tmux set-option -u -t "$1" "$o" >/dev/null 2>&1 || true
+  done
+}
+
+# What a pane whose claude died last printed, on one line for a warning: its
+# error if it printed one, otherwise its last lines, and the exit status.
+# Some history is read too: claude leaves the cursor at the bottom of the
+# screen, so what the next process prints scrolls straight out of view.
+_pane_last_words() {
+  local st
+  st=$(_pane_fmt "$1" '#{pane_dead_status}')
+  { tmux capture-pane -p -J -t "$1" -S -40 2>/dev/null || true; } | awk -v st="$st" '
+    /^Pane is dead/ { next }
+    NF { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); l[++n] = $0 }
+    END {
+      from = (n > 2 ? n - 2 : 1)
+      for (i = (n > 15 ? n - 14 : 1); i <= n; i++) if (l[i] ~ /[Ee]rror|[Nn]ot found|No such file/) { from = i; break }
+      out = ""
+      for (i = from; i <= n && i < from + 3; i++) out = out (out == "" ? "" : " / ") l[i]
+      if (st != "") out = out (out == "" ? "" : " ") "(exit status " st ")"
+      print substr(out, 1, 400)
+    }'
+}
+
 # ---------- restart machinery ----------
 
 # Set (or unset) remain-on-exit on a pane so it survives claude exiting.
@@ -576,11 +769,43 @@ _set_remain() {
   fi
 }
 
+# Which question claude is asking on its way out, if any, given the bottom of
+# its screen: "work" or "worktree". A dialog takes the place of the input box,
+# so nothing counts while the box is on screen, and the title and an option
+# must each be a line of their own: a conversation that merely quotes the
+# dialog is not taken for it.
+_exit_dialog() {
+  awk '
+    { l[NR] = $0 }
+    END {
+      for (i = 2; i <= NR; i++) if (l[i] ~ /^❯/ && l[i-1] ~ /^[[:space:]]*─/) exit
+      for (i = 1; i <= NR; i++) {
+        s = l[i]; sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
+        if (s == "Background work is running") t = "work"
+        else if (s == "Exiting worktree session") t = "worktree"
+        else if (s ~ /^(❯[[:space:]]*)?[0-9]\. Exit and stop tasks$/) stop = 1
+        else if (s ~ /^(❯[[:space:]]*)?[0-9]\. Keep worktree/) keep = 1
+        else if (s ~ /Esc to cancel/) esc = 1
+      }
+      if (t == "work" && stop && esc) print "work"
+      else if (t == "worktree" && keep) print "worktree"
+    }' <<< "$1"
+}
+
 # Ask the claude in a pane to exit and wait up to $2 seconds for the pane to die.
 # Escape closes any open menu (or interrupts a running turn), Ctrl-C clears
 # unsent input, then /exit shuts claude down cleanly so it prints its resume hint.
+#
+# Claude asks before it exits in two cases. "Exiting worktree session" gets
+# its default answer, which keeps the worktree. "Background work is running"
+# (subagents, background shells) is answered Stay and the exit given up,
+# unless $3 is 1: then "Exit and stop tasks" is picked, by its number. Never
+# "Move to background and exit": that hands the conversation to a background
+# process, and 'claude --resume' then refuses to open it here.
+# Returns 0 once claude has exited, 1 if it did not exit in time, 2 if it was
+# left running because of background work.
 _exit_claude() {
-  local pane="$1" wait="${2:-30}" i=0
+  local pane="$1" wait="${2:-30}" stop_work="${3:-0}" i=0 screen n
   tmux send-keys -t "$pane" Escape
   tmux send-keys -t "$pane" C-c
   sleep 0.5
@@ -591,15 +816,42 @@ _exit_claude() {
   fi
   until _pane_dead "$pane"; do
     i=$(( i + 1 ))
-    [ "$i" -lt "$wait" ] || return 1
+    if [ "$i" -ge "$wait" ]; then
+      # leave nothing half-asked or half-typed behind
+      case "$(_pane_input_state "$pane")" in
+        dialog) tmux send-keys -t "$pane" Escape ;;
+        typing) [ "$(_pane_prompt_typed "$pane")" != "/exit" ] || tmux send-keys -t "$pane" C-u ;;
+      esac
+      return 1
+    fi
     sleep 1
+    screen=$(_pane_text "$pane" | tail -n 25)
+    case "$(_exit_dialog "$screen")" in
+      work)
+        n=""
+        if [ "$stop_work" = "1" ]; then
+          n=$(sed -n 's/.*\([0-9]\)\. Exit and stop tasks.*/\1/p' <<< "$screen" | head -n 1) || n=""
+        fi
+        if [ -z "$n" ]; then
+          tmux send-keys -t "$pane" Escape            # Stay
+          return 2
+        fi
+        tmux send-keys -t "$pane" -l "$n"
+        continue ;;
+      worktree)
+        tmux send-keys -t "$pane" Enter               # the default keeps the worktree
+        continue ;;
+    esac
     [ $(( i % 4 )) -eq 0 ] || continue
     if [ "$(_pane_prompt_typed "$pane")" = "/exit" ]; then
-      tmux send-keys -t "$pane" Enter               # Enter was swallowed; press it again
+      tmux send-keys -t "$pane" Enter                 # Enter was swallowed; press it again
     elif [ "$i" -ge 8 ]; then
       case "$(_pane_input_state "$pane")" in
-        busy)  tmux send-keys -t "$pane" Escape ;;  # something got submitted by accident; interrupt it
-        empty) tmux send-keys -t "$pane" C-c; sleep 0.4; tmux send-keys -t "$pane" C-c ;;
+        busy)    tmux send-keys -t "$pane" Escape ;;  # something got submitted by accident; interrupt it
+        empty)   tmux send-keys -t "$pane" C-c; sleep 0.4; tmux send-keys -t "$pane" C-c ;;
+        bg-work) if [ "$stop_work" = "1" ]; then
+                   tmux send-keys -t "$pane" C-c; sleep 0.4; tmux send-keys -t "$pane" C-c
+                 fi ;;
       esac
     fi
   done
@@ -632,27 +884,34 @@ _parse_worktree() {
 }
 
 # Restart claude in place inside session $1, resuming the same conversation.
-# $2 = 1 to force (interrupt a busy claude / discard unsent input).
-# Remaining arguments are passed to the new claude.
-# Restart claude in place inside session $1, resuming the same conversation.
-# $2 = 1 to force (interrupt a busy claude / discard unsent input).
-# Remaining arguments are passed to the new claude.
+# $2 = 1 to force (interrupt a busy claude, discard unsent input, dismiss a
+# dialog); background work is never stopped. Remaining arguments are passed
+# to the new claude.
 _restart_session() {
   local name="$1" force="$2"; shift 2
-  local pane path state rc text arg wt model effort
+  local pane path="" state rc text arg wt model effort id="" ex
   pane=$(_claude_pane "$name")
   [ -n "$pane" ] || { warn "$name: no pane found"; return 1; }
   if [ "${TMUX_PANE:-}" = "$pane" ]; then
     warn "$name: this command is running inside that session's claude; run it from another tmux window or terminal"
     return 1
   fi
-  path=$(_pane_fmt "$pane" '#{pane_current_path}')
   rc=$(_pane_rc_state "$pane")
 
   if _pane_dead "$pane"; then
+    # An earlier restart that failed left a note of what it was bringing back.
+    if _pending_get "$name"; then
+      _retry_session "$name" "$@"
+      return
+    fi
     printf '%s: claude already exited; ' "$name"
   else
+    path=$(_pane_fmt "$pane" '#{pane_current_path}')
     state=$(_pane_input_state "$pane")
+    if [ "$state" = "bg-work" ]; then
+      warn "$name: claude is $(_state_words bg-work), which exiting would stop; skipped. Let it finish, or stop it in the session (/tasks)"
+      return 1
+    fi
     if [ "$force" -ne 1 ]; then
       case "$state" in
         busy)   warn "$name: claude is working (esc to interrupt); skipped, use --force to interrupt it"; return 1 ;;
@@ -661,12 +920,23 @@ _restart_session() {
         none)   warn "$name: claude is not at a prompt (still starting?); skipped, use --force"; return 1 ;;
       esac
     fi
+    # Only stop a claude if a new one can start right now.
+    if ! _claude_ready; then
+      warn "$name: Claude Code is being installed or updated, so a new claude could not start yet; left running, try again in a few minutes"
+      return 1
+    fi
+    id=$(_pane_claude_session "$pane")   # in case claude prints no resume hint
     _set_remain "$pane" on
     printf '%s: stopping claude... ' "$name"
-    if ! _exit_claude "$pane" 30; then
+    ex=0; _exit_claude "$pane" 30 || ex=$?
+    if [ "$ex" -ne 0 ]; then
       printf 'no\n'
       _set_remain "$pane" unset
-      warn "$name: claude did not exit within 30s; left running"
+      if [ "$ex" -eq 2 ]; then
+        warn "$name: claude has background work running, which exiting would stop; left running"
+      else
+        warn "$name: claude did not exit within 30s; left running"
+      fi
       return 1
     fi
   fi
@@ -674,6 +944,13 @@ _restart_session() {
   text=$(tmux capture-pane -p -J -t "$pane" -S -300 2>/dev/null || true)
   arg=$(_parse_resume_arg "$text")
   wt=$(_parse_worktree "$text")
+  [ -n "$arg" ] || arg="$id"
+  # A dead pane reports no directory: use the one the session was started
+  # in, or failing that the one in the conversation's transcript.
+  if [ -z "$path" ] || [ ! -d "$path" ]; then
+    path=$(_pane_fmt "$pane" '#{session_path}')
+    if [ -z "$path" ] || [ ! -d "$path" ]; then path=$(_transcript_cwd "$arg"); fi
+  fi
   if [ -z "$arg" ]; then
     warn "$name: no resume hint found on screen; using --continue (most recent conversation in $path)"
   fi
@@ -682,18 +959,36 @@ _restart_session() {
   printf 'restarted %s\n' "$CAME_BACK"
 }
 
+# Bring back session $1 from the note a failed restart left on it. Further
+# arguments go to claude.
+_retry_session() {
+  local name="$1" pane path; shift
+  _pending_get "$name" || { warn "$name: no failed restart to carry on with"; return 1; }
+  pane=$(_claude_pane "$name")
+  path="$PN_path"
+  if [ -z "$path" ] || [ ! -d "$path" ]; then path=$(_pane_fmt "$pane" '#{session_path}'); fi
+  printf '%s: claude is down after a failed restart; starting it again... ' "$name"
+  _bring_up "$name" "$pane" "$path" "$PN_which" "$PN_wt" "$PN_rc" "$PN_model" "$PN_effort" "$@" || return 1
+  printf 'restarted %s\n' "$CAME_BACK"
+}
+
 # Start claude in pane $2 of session $1, in directory $3. $4 says which
 # conversation: a resume id, '--continue' for the most recent one in that
 # directory, or empty for a new one. $5 is a worktree name, Remote Control
 # is turned on unless $6 is 'off', and $7/$8 are the model and effort to put
 # back. Any further arguments go to claude and win over the restored ones.
-# Sets CAME_BACK to a description of what came back; prints 'failed' and
-# returns 1 if claude would not start (the pane is kept so the error stays
-# readable).
+#
+# While Claude Code is installing an update there is no working claude, so
+# this waits for one first, and again if the new claude dies at once because
+# an update started meanwhile; then it tries once more without the restored
+# model and effort. Sets CAME_BACK to a description of what came back. If
+# claude still will not start it prints 'failed', says why, keeps the pane so
+# the error stays readable, leaves a note for a later retry (_pending_set)
+# and returns 1.
 CAME_BACK=""
 _bring_up() {
   local name="$1" pane="$2" path="$3" which="$4" wt="$5" rc="$6" model="$7" effort="$8"; shift 8
-  local line
+  local line why="" up=0
   local -a cmd=() base=() restore=()
   while IFS= read -r line; do
     [ -z "$line" ] || restore+=("$line")
@@ -713,22 +1008,46 @@ _bring_up() {
   if [ $# -gt 0 ]; then cmd+=("$@"); base+=("$@"); fi   # explicit arguments win
   if [ "$rc" != "off" ]; then cmd+=(--remote-control); base+=(--remote-control); fi
 
-  if ! _respawn_claude "$name" "$pane" "$path" "${cmd[@]}"; then
-    if [ ${#restore[@]} -eq 0 ]; then
+  if ! _claude_ready; then
+    printf 'waiting for Claude Code to finish updating... '
+    if ! _claude_wait_ready "$INSTALL_WAIT"; then
       printf 'failed\n'
-      warn "$name: claude exited right after starting; the pane was kept so you can read why ('$PROG resume $name')"
+      warn "$name: a new claude still cannot start after $(_secs_words "$INSTALL_WAIT") ('claude --version' fails, or an update holds Claude Code's lock)"
+      _bring_up_failed "$name" "$which" "$wt" "$rc" "$model" "$effort" "$path"
       return 1
     fi
-    # The likeliest reason is a model or setting this claude will not take.
-    warn "$name: claude would not start with ${restore[*]}; retrying without it"
-    if ! _respawn_claude "$name" "$pane" "$path" "${base[@]}"; then
-      printf 'failed\n'
-      warn "$name: claude exited right after starting; the pane was kept so you can read why ('$PROG resume $name')"
-      return 1
-    fi
-    cmd=("${base[@]}"); restore=(); model=""; effort=""
   fi
 
+  if _respawn_claude "$name" "$pane" "$path" "${cmd[@]}"; then
+    up=1
+  else
+    why=$(_pane_last_words "$pane")
+    if ! _claude_ready; then
+      warn "$name: claude exited right after starting ($why); Claude Code is being updated, waiting for it"
+      if _claude_wait_ready "$INSTALL_WAIT" && _respawn_claude "$name" "$pane" "$path" "${cmd[@]}"; then
+        up=1
+      else
+        why=$(_pane_last_words "$pane")
+      fi
+    fi
+  fi
+  if [ "$up" -eq 0 ] && [ ${#restore[@]} -gt 0 ]; then
+    # Otherwise the likeliest reason is a model or setting this claude will not take.
+    warn "$name: claude would not start with ${restore[*]} ($why); retrying without it"
+    if _respawn_claude "$name" "$pane" "$path" "${base[@]}"; then
+      up=1; cmd=("${base[@]}"); restore=()
+    else
+      why=$(_pane_last_words "$pane")
+    fi
+  fi
+  if [ "$up" -eq 0 ]; then
+    printf 'failed\n'
+    warn "$name: claude exited right after starting: $why"
+    _bring_up_failed "$name" "$which" "$wt" "$rc" "$model" "$effort" "$path"
+    return 1
+  fi
+
+  _pending_clear "$name"
   _sess_set "$name" @cmm_last_restart "$(date +%s)"
   case "$which" in ""|--continue) ;; *) _sess_set "$name" @cmm_session "$which" ;; esac
   _remember_flags "$name" "${cmd[@]}"
@@ -741,17 +1060,28 @@ _bring_up() {
   CAME_BACK="$CAME_BACK)"
 }
 
+# A bring-up of session $1 failed: note what it was bringing back (the
+# arguments of _pending_set) and say how it will be tried again.
+_bring_up_failed() {
+  _pending_set "$@"
+  if [ -f "$(_pause_file "$1")" ]; then
+    warn "$1: the pane was kept so you can read why ('$PROG resume $1'); run '$PROG reload' again to retry"
+  else
+    warn "$1: the pane was kept so you can read why ('$PROG resume $1'); '$PROG restart $1' tries again, and so does '$PROG maintain' on its next pass"
+  fi
+}
+
 # Start a claude command line in a pane and wait for it to come up. The pane is
 # kept when claude dies so the error stays readable; returns 1 in that case.
 _respawn_claude() {
   local name="$1" pane="$2" path="$3"; shift 3
   local i=0 state=""
   _set_remain "$pane" on
-  tmux respawn-pane -k -t "$pane" -c "$path" "$(_shell_join "$@")"
+  tmux respawn-pane -k -t "$pane" -c "$path" "$(_shell_join "$@")" || return 1
   while [ "$i" -lt 15 ]; do
     if _pane_dead "$pane"; then return 1; fi
     state=$(_pane_input_state "$pane")
-    case "$state" in empty|typing|busy) break ;; esac
+    case "$state" in empty|typing|busy|bg-work) break ;; esac
     sleep 1; i=$(( i + 1 ))
   done
   _set_remain "$pane" unset
@@ -825,12 +1155,20 @@ Options:
             the working directory. Read from each session's transcript, so it
             is a best guess when several sessions share a directory.
 
-The STATUS column is read from each session's screen:
+The STATUS column is read from each session's screen, and from what Claude
+Code reports for it ('claude agents --json'):
   idle | busy | typing            what claude is doing right now
+  bg-work                         at its prompt, but subagents or background
+                                  shells are still running; treated as busy
   dialog | no-prompt              waiting for an answer, or not at a prompt
   update-ready                    a newer Claude Code is installed and waiting
                                   for a restart ('$PROG update')
   rc:on | rc:failed | rc:off ...  Remote Control state ('$PROG maintain')
+  exited | paused                 claude is not running ('$PROG reload' brings
+                                  back a paused one)
+  restart-failed                  a restart could not bring claude back; the
+                                  next '$PROG maintain' pass, or
+                                  '$PROG restart NAME', tries again
 EOF
       ;;
     new|start)
@@ -884,6 +1222,17 @@ longer knows; 'ultracode' effort is restored through --settings.
 Before restarting anything, 'claude update' is run once so the latest
 version is installed ('$PROG restart' or --restart-only skips that step).
 
+While Claude Code installs an update, the 'claude' command is missing or a
+placeholder that cannot start, so $PROG first makes sure a new claude can
+start ('claude --version' answers, no updater holds Claude Code's update
+lock), waiting up to 5 minutes for that before giving up without touching
+anything. If the restarted claude still dies at once, $PROG shows what it
+printed, waits for an install that started meanwhile and tries again, then
+tries without the restored model and effort. A session that does not come
+back keeps a note of what it was bringing back: '$PROG list' shows it as
+'restart-failed', and running '$PROG restart' on it (or the next
+'$PROG maintain' pass) tries again.
+
 Which sessions:
   (none)       the session you are in when run from a second window of a
                $PROG tmux session; otherwise pick from the list under \$PWD
@@ -899,8 +1248,11 @@ Options:
   -- <args>        extra arguments for the restarted claude
 
 Sessions that are busy or not sitting at an empty prompt are skipped unless
---force is given. Run this from outside the claude you are restarting (a
-second tmux window, or another terminal); it refuses to restart itself.
+--force is given. A session running background work (subagents or
+background shells, 'bg-work' in '$PROG list') is always skipped, because
+exiting would stop that work: let it finish, or stop it in the session
+(/tasks). Run this from outside the claude you are restarting (a second
+tmux window, or another terminal); it refuses to restart itself.
 EOF
       ;;
     restart)
@@ -931,12 +1283,19 @@ that is in use. Each pass walks every claude-* session on this host and:
     then gives up until somebody runs that command.
 
 A session is only touched when all of this holds: claude is idle at an
-empty prompt (not busy, no unsent text, no dialog open), its screen has not
-changed for a few seconds, no attached client has typed in it for --idle
-minutes, and $PROG has not restarted it within --cooldown minutes. A pass
-restarts at most --max sessions and stops restarting after a failure.
-Everything skipped is simply looked at again next pass, and only one pass
-runs at a time on a host.
+empty prompt (not busy, no unsent text, no dialog open, and Claude Code
+reports no background work such as subagents or background shells), its
+screen has not changed for a few seconds, no attached client has typed in it
+for --idle minutes, and $PROG has not restarted it within --cooldown
+minutes. A pass restarts at most --max sessions and stops restarting after a
+failure. Nothing is restarted while Claude Code is installing an update
+(the 'claude' command cannot start then). Everything skipped is simply
+looked at again next pass, and only one pass runs at a time on a host.
+
+A session whose restart did not come back ('restart-failed' in
+'$PROG list') is started again on the next pass, with the conversation,
+model, effort, worktree and Remote Control it was being restarted with; after
+$RETRY_MAX failed passes it is left for '$PROG restart NAME'.
 
 Options:
   --once           a single pass, then exit (what the installed job runs)
@@ -985,17 +1344,19 @@ which survives the reboot. The tmux session itself is left as it is, with
 the exit hint on screen: the reboot clears it, and '$PROG reload' reuses it
 if there was no reboot after all.
 
-A session that is still working, waiting for an answer on screen, or not
-at a prompt yet is waited for, up to --wait minutes, and paused as soon as
-it is idle. It is never interrupted: anything still busy when the wait
-runs out is left running and listed, and $PROG exits with status 1 so you
-know it is not yet safe to reboot. Unsent text in a prompt is saved and
-typed back, unsubmitted, when the session is reloaded.
+A session that is still working (background work such as subagents or
+background shells included), waiting for an answer on screen, or not at a
+prompt yet is waited for, up to --wait minutes, and paused as soon as it is
+idle. It is never interrupted: anything still busy when the wait runs out
+is left running and listed, and $PROG exits with status 1 so you know it is
+not yet safe to reboot. Unsent text in a prompt is saved and typed back,
+unsubmitted, when the session is reloaded.
 
 Options:
   --all          every claude session on the host, not only those under \$PWD
   --wait MINS    how long to wait for busy sessions (default 10; 0 = not at all)
-  -f, --force    interrupt busy sessions and dismiss dialogs instead of waiting
+  -f, --force    interrupt busy sessions, stop their background work and
+                 dismiss dialogs instead of waiting
   -y, --yes      do not ask for confirmation
   -n, --dry-run  show what would be paused and change nothing
 
@@ -1112,7 +1473,13 @@ cmd_list() {
     i=$((i+1))
     att="no"; [ "${attached:-0}" -gt 0 ] && att="yes"
     tags=$(_pane_tags "$(_claude_pane "$name")")
-    if [ "$tags" = "exited" ] && [ -f "$(_pause_file "$name")" ]; then tags="paused"; fi
+    if [ "$tags" = "exited" ]; then
+      if [ -f "$(_pause_file "$name")" ]; then
+        tags="paused"
+      elif [ -n "$(_sess_get "$name" @cmm_pending)" ]; then
+        tags="restart-failed"
+      fi
+    fi
     if [ "$show_model" -eq 1 ]; then
       printf "%-3s  %-${w}s  %-8s  %-28s  %s\n" \
         "$i" "$name" "$(_human_age "$created")" "$tags" "$(_restore_summary "$name" "$(_session_id "$name" "$path")")"
@@ -1149,6 +1516,7 @@ cmd_new() {
     name="${name}-${n}"
   fi
 
+  _await_claude "no session was started"
   tmux new-session -d -s "$name" -c "$PWD" "$(_shell_join claude ${extra[@]+"${extra[@]}"})"
   _remember_flags "$name" ${extra[@]+"${extra[@]}"}
   printf 'started %s in %s\n' "$name" "$PWD"
@@ -1215,15 +1583,18 @@ cmd_update() {
   if [ "$pending" -eq 1 ]; then
     for n in "${targets[@]}"; do
       pane=$(_claude_pane "$n")
-      if [ -n "$pane" ] && _pane_update_ready "$pane"; then kept+=("$n"); fi
+      [ -n "$pane" ] || continue
+      if _pane_update_ready "$pane" || [ -n "$(_sess_get "$n" @cmm_pending)" ]; then kept+=("$n"); fi
     done
     if [ ${#kept[@]} -eq 0 ]; then printf 'no sessions under %s are waiting for a restart\n' "$PWD"; return 0; fi
     targets=("${kept[@]}")
   fi
 
+  _await_claude "no sessions were restarted"
   if [ "$do_update" -eq 1 ]; then
     printf 'checking for claude updates...\n'
     claude update || die "'claude update' failed; no sessions were restarted (use --restart-only to restart anyway)"
+    _await_claude "no sessions were restarted"
   fi
 
   # Wait a little for a maintenance pass to finish, then go ahead regardless:
@@ -1270,7 +1641,7 @@ _maint_ready() {
   local name="$1" pane="$2" why="$3" state
   state=$(_pane_input_state "$pane")
   if [ "$state" != "empty" ]; then
-    log "$name: $why, but claude is $state; leaving it alone"
+    log "$name: $why, but claude is $(_state_words "$state"); leaving it alone"
     return 1
   fi
   if _session_recently_active "$name" $(( MT_IDLE * 60 )); then
@@ -1297,16 +1668,18 @@ _maint_cooldown_ok() {
   [ $(( $(date +%s) - last )) -ge $(( MT_COOLDOWN * 60 )) ]
 }
 
-# Restart a session as part of a pass, logging the outcome on one line.
-_maint_restart() {
+# Run a restart as part of a pass ($@: the function and its arguments),
+# logging everything it says on one line.
+_maint_run() {
   local out rc=0
-  out=$(_restart_session "$1" 0 2>&1) || rc=1
+  out=$("$@" 2>&1) || rc=1
   log "$(printf '%s' "$out" | tr '\n' ' ')"
   return "$rc"
 }
+_maint_restart() { _maint_run _restart_session "$1" 0; }
 
 _maintain_pass() {
-  local rows name _rest pane rc restarts=0 acted=0 broke=0 seen=0
+  local rows name _rest pane rc restarts=0 acted=0 broke=0 seen=0 ready=1
 
   rows=$(_collect_sessions "all") || true
   if [ -z "$rows" ]; then log "no claude sessions on this host"; return 0; fi
@@ -1314,13 +1687,45 @@ _maintain_pass() {
   if [ "$MT_UPDATE" -eq 1 ] && [ "$MT_DRY" -eq 0 ]; then
     claude update >/dev/null 2>&1 || log "'claude update' failed; carrying on with the installed version"
   fi
+  # A restart needs a claude that can start, and there is none while Claude
+  # Code installs an update (see _claude_ready).
+  if ! _claude_ready; then
+    ready=0
+    log "Claude Code is being installed or updated, so a new claude cannot start yet; no restarts this pass"
+  fi
 
   while IFS='|' read -r name _rest; do
     [ -n "$name" ] || continue
     pane=$(_claude_pane "$name")
     [ -n "$pane" ] || continue
-    if _pane_dead "$pane"; then continue; fi
     if [ "${TMUX_PANE:-}" = "$pane" ]; then continue; fi   # never ourselves
+    if _pane_dead "$pane"; then
+      # Down after a restart that did not come back (cmm left a note);
+      # paused sessions wait for 'cmm reload' instead.
+      _pending_get "$name" || continue
+      [ ! -f "$(_pause_file "$name")" ] || continue
+      seen=$(( seen + 1 ))
+      if [ "$PN_tries" -ge "$RETRY_MAX" ]; then
+        log "$name: down after $PN_tries failed restarts; no more tries ('$PROG restart $name' tries again)"
+      elif [ "$broke" -eq 1 ]; then
+        log "$name: down after a failed restart, but a restart already failed this pass; next time"
+      elif [ "$restarts" -ge "$MT_MAX" ]; then
+        log "$name: down after a failed restart, but $MT_MAX session(s) were restarted this pass; next time"
+      elif [ "$ready" -eq 0 ]; then
+        log "$name: down after a failed restart; Claude Code is still being installed, next time"
+      elif [ "$MT_DRY" -eq 1 ]; then
+        log "$name: down after a failed restart; would start it again (dry run)"
+      else
+        log "$name: down after a failed restart; starting it again"
+        if _maint_run _retry_session "$name"; then
+          restarts=$(( restarts + 1 )); acted=$(( acted + 1 ))
+        else
+          broke=1
+          log "no more restarts this pass"
+        fi
+      fi
+      continue
+    fi
     seen=$(( seen + 1 ))
     rc=$(_pane_rc_state "$pane")
 
@@ -1330,6 +1735,8 @@ _maintain_pass() {
         log "$name: update waiting, but a restart already failed this pass; leaving it alone"
       elif [ "$restarts" -ge "$MT_MAX" ]; then
         log "$name: update waiting, but $MT_MAX session(s) were restarted this pass; next time"
+      elif [ "$ready" -eq 0 ]; then
+        log "$name: update waiting, but Claude Code is still being installed; next time"
       elif ! _maint_cooldown_ok "$name"; then
         log "$name: update waiting, but cmm restarted it less than ${MT_COOLDOWN}m ago; next time"
       elif _maint_ready "$name" "$pane" "update waiting"; then
@@ -1380,7 +1787,7 @@ _maintain_pass() {
         sleep 1
       fi
       log "$name: remote control is now $(_pane_rc_state "$pane")"
-      if [ "$MT_RESTART_RC" -eq 1 ] && [ "$broke" -eq 0 ] && [ "$restarts" -lt "$MT_MAX" ]; then
+      if [ "$MT_RESTART_RC" -eq 1 ] && [ "$ready" -eq 1 ] && [ "$broke" -eq 0 ] && [ "$restarts" -lt "$MT_MAX" ]; then
         sleep 20
         if [ "$(_pane_rc_state "$pane")" = "failed" ] && _pane_rc_needs_restart "$pane" \
            && _maint_cooldown_ok "$name"; then
@@ -1749,10 +2156,10 @@ _pause_write() {
 # box's bottom border, with the indent removed. Empty unless a multi-line
 # prompt is being composed.
 _pane_prompt_more() {
-  _pane_text "$1" | awk '
+  _pane_text "$1" | awk -v scan="$BOX_SCAN" '
     { l[NR] = $0 }
     END {
-      for (i = NR; i > 0 && i > NR - 12; i--)
+      for (i = NR; i > 0 && i > NR - scan; i--)
         if (l[i] ~ /^❯/ && i > 1 && l[i-1] ~ /^[[:space:]]*─/) { start = i; break }
       if (!start) exit
       for (i = start + 1; i <= NR; i++) {
@@ -1807,16 +2214,13 @@ _type_text() {
 }
 
 # Pause one session: stop its claude cleanly and write the manifest entry.
-# $2 = 1 to interrupt a busy claude or dismiss a dialog. Returns 1 if the
-# session was left running, 2 if it is not ready (busy, showing a dialog, not
-# at a prompt) and should be looked at again; the caller decides how long.
-# Pause one session: stop its claude cleanly and write the manifest entry.
-# $2 = 1 to interrupt a busy claude or dismiss a dialog. Returns 1 if the
-# session was left running, 2 if it is not ready (busy, showing a dialog, not
-# at a prompt) and should be looked at again, 3 if nothing is running in it
-# but it could not be recorded; the caller decides how long to wait.
+# $2 = 1 to interrupt a busy claude, stop its background work or dismiss a
+# dialog. Returns 1 if the session was left running, 2 if it is not ready
+# (busy, running background work, showing a dialog, not at a prompt) and
+# should be looked at again, 3 if nothing is running in it but it could not
+# be recorded; the caller decides how long to wait.
 _pause_session() {
-  local name="$1" force="$2" pane state="" text file how dir
+  local name="$1" force="$2" pane state="" text file how dir id="" ex pending=0
   pane=$(_claude_pane "$name")
   [ -n "$pane" ] || { warn "$name: no pane found; left alone"; return 1; }
   if [ "${TMUX_PANE:-}" = "$pane" ]; then
@@ -1840,12 +2244,15 @@ _pause_session() {
       empty|typing) ;;
       *) [ "$force" -eq 1 ] || return 2 ;;
     esac
-    if [ "$state" = "typing" ]; then P_typed=$(_pane_unsent "$pane"); fi
+    case "$state" in typing|bg-work) P_typed=$(_pane_unsent "$pane") ;; esac
+    id=$(_pane_claude_session "$pane")   # in case claude prints no resume hint
     _set_remain "$pane" on
     printf '%s: stopping claude... ' "$name"
-    if ! _exit_claude "$pane" 30; then
+    ex=0; _exit_claude "$pane" 30 "$force" || ex=$?
+    if [ "$ex" -ne 0 ]; then
       printf 'no\n'
       _set_remain "$pane" unset
+      [ "$ex" -ne 2 ] || return 2       # background work turned up: wait for it
       warn "$name: claude did not exit within 30s; left running"
       return 1
     fi
@@ -1854,6 +2261,15 @@ _pause_session() {
   text=$(tmux capture-pane -p -J -t "$pane" -S -300 2>/dev/null || true)
   P_session=$(_parse_resume_arg "$text")
   P_worktree=$(_parse_worktree "$text")
+  # Down after a restart that did not come back: cmm's note says what it was
+  # bringing back.
+  if [ -z "$state" ] && _pending_get "$name"; then
+    pending=1
+    case "$PN_which" in ""|--continue) ;; *) P_session="$PN_which" ;; esac
+    P_worktree="$PN_wt"; P_rc="$PN_rc"
+    if [ -n "$PN_path" ] && [ -d "$PN_path" ]; then P_path="$PN_path"; fi
+  fi
+  [ -n "$P_session" ] || P_session="$id"
   how=""
   if [ -z "$P_session" ]; then
     # No hint on screen. After a clean exit the transcript claude just wrote
@@ -1882,6 +2298,7 @@ _pause_session() {
     fi
   fi
   { read -r P_model; read -r P_effort; } < <(_restore_pick "$name" "$P_session")
+  if [ "$pending" -eq 1 ]; then P_model="$PN_model"; P_effort="$PN_effort"; fi
   _pause_write "$name"
   printf 'paused (%s%s%s)\n' "$how" "$(_kept_summary "$P_model" "$P_effort")" \
     "$( [ -z "$P_typed" ] || printf ', unsent text saved' )"
@@ -2034,10 +2451,19 @@ cmd_pause() {
       typing)   printf "  %-${w}s  typing     will be paused, unsent text saved\n" "$n" ;;
       exited)   if [ -f "$(_pause_file "$n")" ]; then
                   printf "  %-${w}s  paused     already paused\n" "$n"
+                elif [ -n "$(_sess_get "$n" @cmm_pending)" ]; then
+                  printf "  %-${w}s  exited     its restart failed; will be recorded from what that restart was bringing back\n" "$n"
                 else
                   printf "  %-${w}s  exited     claude already gone; will be recorded from its exit hint\n" "$n"
                 fi ;;
       "this one") printf "  %-${w}s  this one   cannot pause the session this command runs in\n" "$n" ;;
+      bg-work)  if [ "$force" -eq 1 ]; then
+                  printf "  %-${w}s  bg-work    its background work will be stopped (--force)\n" "$n"
+                elif [ "$wait_mins" -gt 0 ]; then
+                  printf "  %-${w}s  bg-work    will wait up to %dm for its background work, never stop it\n" "$n" "$wait_mins"
+                else
+                  printf "  %-${w}s  bg-work    will be left running (--wait 0)\n" "$n"
+                fi ;;
       *)        if [ "$force" -eq 1 ]; then
                   printf "  %-${w}s  %-9s  will be interrupted (--force)\n" "$n" "$state"
                 elif [ "$wait_mins" -gt 0 ]; then
@@ -2098,6 +2524,7 @@ cmd_pause() {
       for n in "${later[@]}"; do
         case "$(_pane_input_state "$(_claude_pane "$n")")" in
           busy)   warn "$n: still working$( [ "$wait_mins" -gt 0 ] && printf ' after %dm' "$wait_mins" ); left running (--force interrupts it)" ;;
+          bg-work) warn "$n: background work still running$( [ "$wait_mins" -gt 0 ] && printf ' after %dm' "$wait_mins" ); left running (--force stops it)" ;;
           dialog) warn "$n: waiting for an answer on screen; left running (answer it, or --force dismisses it)" ;;
           *)      warn "$n: not at a prompt; left running (--force)" ;;
         esac
@@ -2169,6 +2596,7 @@ cmd_reload() {
     return 0
   fi
   need claude
+  if [ ${#files[@]} -gt 0 ]; then _await_claude "nothing was reloaded"; fi
 
   if [ -d "$STATE_DIR/lock" ]; then
     printf 'waiting for a running %s maintain pass...\n' "$PROG"

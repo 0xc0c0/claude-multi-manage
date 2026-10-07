@@ -55,14 +55,36 @@ cd ~ && cmm update --all   # every session on the host
 ```
 
 Sessions that are busy or have unsent text in the prompt are skipped unless
-you pass `--force`. `cmm list` shows `update-ready` next to sessions that need
-it. Run it from outside the Claude you are restarting.
+you pass `--force`. A session with background work running (subagents or
+background shells; `bg-work` in `cmm list`) is always skipped, because exiting
+would stop that work: let it finish, or stop it in the session with `/tasks`.
+`cmm list` shows `update-ready` next to sessions that need it. Run it from
+outside the Claude you are restarting.
+
+### When Claude Code is in the middle of updating itself
+
+While Claude Code installs an update (with an npm install), the `claude`
+command is missing or a placeholder that only prints `Error: claude native
+binary not installed.`, so a Claude started then dies at once. `cmm` therefore
+stops nothing until a new Claude can start: `claude --version` has to answer
+and no updater may hold Claude Code's update lock. `cmm update`, `restart`,
+`new` and `reload` wait up to five minutes for that (`CMM_INSTALL_WAIT`
+seconds), and a maintenance pass leaves its restarts for the next pass.
+
+If a restarted Claude dies anyway, `cmm` shows what it printed, waits for an
+install that started meanwhile, tries again, and then tries once more without
+the restored model and effort. A session that still does not come back keeps
+a note of what was being brought back: `cmm list` shows it as
+`restart-failed`, and `cmm restart NAME` (or the next maintenance pass) brings
+back the same conversation, model, effort, worktree and Remote Control.
 
 ### The model and effort level come back too
 
 Claude does not carry either across a resume: `/model` saves your choice as the
-default for *new* sessions and `/effort` is explicitly session-only, so a plain
-`claude --resume` starts on your global defaults. Before restarting, `cmm` reads
+default for *new* sessions, and `/effort` either stays with the session (`max`)
+or becomes the default for new sessions on that model, so a plain
+`claude --resume` starts on whatever your defaults are by then, which other
+sessions keep changing. Before restarting, `cmm` reads
 the session's own transcript to see which model it was replying with and which
 `/effort` you last set, and passes them to the new Claude
 (`--model opus --effort max`, or `--settings '{"ultracode":true}'` for
@@ -87,12 +109,20 @@ connection for about 30 minutes and then gives up until someone runs that
 command.
 
 It is deliberately timid. A session is only touched when Claude is idle at an
-empty prompt (not busy, nothing typed, no dialog open), its screen has not
-changed for a few seconds, no attached client has typed in it for `--idle`
-minutes (default 15), and `cmm` has not restarted it within `--cooldown`
-minutes (default 60). At most `--max` sessions (default 2) are restarted per
-pass, and a failure stops the rest. Everything skipped is simply looked at
-again next time, and only one pass runs at a time on a host.
+empty prompt (not busy, nothing typed, no dialog open, and no background work:
+Claude Code reports subagents and background shells as busy even when the
+prompt looks idle), its screen has not changed for a few seconds, no attached
+client has typed in it for `--idle` minutes (default 15), and `cmm` has not
+restarted it within `--cooldown` minutes (default 60). At most `--max`
+sessions (default 2) are restarted per pass, and a failure stops the rest.
+Nothing is restarted while Claude Code is installing an update. Everything
+skipped is simply looked at again next time, and only one pass runs at a
+time on a host.
+
+A session whose restart did not come back (`restart-failed` in `cmm list`)
+is started again on the next pass, with the conversation, model, effort,
+worktree and Remote Control it was being restarted with; after three failed
+passes it is left for `cmm restart NAME`.
 
 ```bash
 cmm maintain --once --dry-run    # what a pass would do right now
@@ -107,9 +137,10 @@ Unattended passes log to `~/.cache/cmm/maintain.log`. With systemd, run
 `loginctl enable-linger $USER` if you want it to keep running while you are
 logged out. `cmm keepalive` still works as an alias for this command.
 
-`cmm list` shows what each session is doing (`idle`, `busy`, `typing`,
-`dialog`), whether it is `update-ready`, and its Remote Control state
-(`rc:on`, `rc:failed`, `rc:off`).
+`cmm list` shows what each session is doing (`idle`, `busy`, `bg-work`,
+`typing`, `dialog`), whether it is `update-ready`, its Remote Control state
+(`rc:on`, `rc:failed`, `rc:off`), and `exited`, `paused` or `restart-failed`
+when Claude is not running in it.
 
 ## Rebooting the host
 
@@ -129,11 +160,12 @@ sudo reboot
 cd ~ && cmm reload         # everything comes back; prints 'cmm list'
 ```
 
-A session that is still working, or waiting for an answer on screen, is
-waited for (`--wait`, default 10 minutes) and paused as soon as it is idle.
-It is never interrupted: anything still busy when the wait runs out is left
-running and listed, and `cmm pause` exits with status 1 so you know it is not
-yet safe to reboot (`--force` interrupts instead). `--all` takes every session
+A session that is still working (background work included), or waiting for
+an answer on screen, is waited for (`--wait`, default 10 minutes) and paused
+as soon as it is idle. It is never interrupted: anything still busy when the
+wait runs out is left running and listed, and `cmm pause` exits with status 1
+so you know it is not yet safe to reboot (`--force` interrupts instead, and
+stops background work, as the reboot would). `--all` takes every session
 on the host rather than those under `$PWD`, `--yes` skips the confirmation
 and `--dry-run` only reports.
 
