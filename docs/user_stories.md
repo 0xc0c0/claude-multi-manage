@@ -19,6 +19,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 
 | ID | Story | Asked | Status |
 |----|-------|-------|--------|
+| [US-014](#us-014--restarts-that-survive-claude-codes-own-updates-and-background-work) | Restarts that survive Claude Code's own updates and background work | 2026-10-07 | In progress |
 | [US-013](#us-013--pause-every-session-before-a-reboot-and-bring-them-back-afterwards) | Pause every session before a reboot and bring them back afterwards | 2026-09-13 | Done |
 | [US-012](#us-012--keep-the-model-and-effort-level-a-session-was-using) | Keep the model and effort level a session was using | 2026-09-07 | Done |
 | [US-011](#us-011--unattended-maintenance-of-idle-sessions) | Unattended maintenance of idle sessions | 2026-09-07 | Done |
@@ -34,6 +35,74 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
 | [US-001](#us-001--start-a-new-claude-session-in-a-directory) | Start a new Claude session in a directory | 2026-08-27 | Done |
 
 ## Stories
+
+### US-014 — Restarts that survive Claude Code's own updates and background work
+
+- **Asked:** 2026-10-07, in conversation: "It seems like this app no longer
+  can update + resume as it had been able to. I suspect something change with
+  claude code's command line agents that this 'cmm' tool wasn't adapted for.
+  please update this app accordingly." And later the same day: "I've started
+  to see my sessions showing 'exited' a lot more... almost everyday. I'm not
+  sure if it's this tool or something broken in a recent claude code update,
+  but I suspect it has something to do with how this tool tries to do
+  recurring updates."
+- **Story:** As a user who leaves `cmm maintain` moving my sessions onto each
+  new Claude Code release, I want every restart to either bring the session
+  back on the new version or leave it running untouched, so that I never come
+  back to an `exited` session with its conversation stranded, and an update
+  never stops work Claude is doing in the background.
+- **Background:** Found when the report came in, on Claude Code 2.1.292/293:
+  - Claude Code now ships a release almost daily, and on an npm install its
+    updater moves `claude` aside and runs `npm install -g`; until the new
+    native binary is linked in, `claude` is missing or a placeholder that
+    prints `Error: claude native binary not installed.` and exits 1. Every
+    restart logged as "claude exited right after starting" since 2026-10-05
+    (4 of 8) fell inside a release window, while the same conversations
+    restarted fine at other times (one had not changed at all in between).
+    cmm retried at once, hit the same window, and left the tmux pane dead:
+    the `exited` sessions.
+  - Sessions now run work in the background: subagents listed under the
+    prompt ("● main / ◯ general-purpose …") and background shells. The
+    prompt looks idle while it runs, so cmm called such a session idle.
+    `/exit` then opens "Background work is running" with "Exit and stop
+    tasks" selected; cmm never answered it and left it open after 30 s, one
+    Enter away from stopping the work. "Move to background and exit" hands
+    the conversation to a background process, after which
+    `claude --resume <id>` refuses to open it. `claude agents --json`
+    reports a session with background work as `busy`.
+  - The agents list is drawn below the footer, so reading "the last 10
+    lines" as the footer can miss `esc to interrupt`, the update notice and
+    the Remote Control state.
+- **Acceptance criteria:**
+  - Nothing is stopped while Claude Code is being installed or updated.
+    Before stopping a session, cmm checks that `claude --version` answers and
+    that no updater holds Claude Code's update lock (which Claude Code treats
+    as stale after five minutes). `cmm update`/`restart` wait up to five
+    minutes for that and give up without touching a session; a maintenance
+    pass leaves its restarts for the next pass.
+  - If the new Claude still dies at once, cmm reports and logs what it
+    printed, waits for an install that started meanwhile and tries again,
+    and then retries without the restored model and effort as before. A
+    session that still does not come back keeps a note of what it was
+    bringing back; `cmm list` shows it as `restart-failed`, and the next
+    maintenance pass (or `cmm restart NAME`) brings back the same
+    conversation, model, effort, worktree and Remote Control, giving up after
+    three failed passes.
+  - A session with background work running counts as busy even when its
+    prompt is idle: `cmm list` shows `bg-work`, maintenance and
+    `cmm update`/`restart` leave it alone (even with `--force`), and
+    `cmm pause` waits for it like a busy session; `cmm pause --force` stops
+    the work, as the reboot would.
+  - If `/exit` opens "Background work is running" anyway, cmm answers Stay
+    (only `cmm pause --force` picks "Exit and stop tasks") and leaves the
+    session running; "Exiting worktree session" gets its default answer
+    (keep the worktree). No dialog cmm opened is left open on screen.
+  - The footer, the input box and the agents list are found by anchoring on
+    the input box rather than on the bottom of the screen.
+  - cmm asks Claude Code (`claude agents --json`) which conversation a
+    running session is in, and uses that when Claude prints no resume hint.
+- **Status:** In progress
+- **Delivered in:** —
 
 ### US-013 — Pause every session before a reboot and bring them back afterwards
 
@@ -64,7 +133,8 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
     resume id from the exit hint, and records the session name, directory,
     resume id, worktree, Remote Control state, model and effort level in a
     manifest that survives the reboot.
-  - A session that is still working, showing a dialog or not yet at a prompt
+  - A session that is still working (background work included, US-014),
+    showing a dialog or not yet at a prompt
     is waited for, up to `--wait` minutes (default 10), and paused as soon as
     it reaches an idle prompt. Anything still busy when the wait runs out is
     left running and listed, and the command exits non-zero so the user
@@ -156,14 +226,17 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
     restarted in place (conversation, model and effort preserved), and
     sessions showing `/rc failed` get `/remote-control` typed for them.
   - A session is only touched when every check passes: Claude is idle at an
-    empty prompt (no dialog, no unsent text, not working), its screen has not
+    empty prompt (no dialog, no unsent text, not working, no background work
+    per US-014), its screen has not
     changed for a few seconds, no attached client has had keyboard activity
     for `--idle` minutes (default 15), and cmm has not restarted it within
     `--cooldown` minutes (default 60). Everything else is left for the next
     pass.
   - A pass restarts at most `--max` sessions (default 2) and stops restarting
     after the first failure; `--dry-run` reports what a pass would do without
-    touching anything.
+    touching anything. A pass restarts nothing while Claude Code is being
+    installed, and a session whose restart failed is retried on later passes
+    (US-014).
   - Only one pass runs at a time on a host (a lock), so a service, a cron job
     and a manual run cannot collide.
   - `cmm maintain --install` installs the service — a systemd user timer where
@@ -252,7 +325,8 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
     footer shows "Update installed · Restart to apply".
   - Sessions that are busy, have unsent text, or show a dialog are skipped
     unless `--force` is given; the command refuses to restart the session it is
-    itself running in.
+    itself running in. Sessions running background work are always skipped,
+    and nothing is stopped while Claude Code is mid-install (US-014).
   - `cmm restart` does the same without running the updater; arguments after
     `--` are passed to the restarted Claude.
   - `cmm list` flags sessions waiting for a restart with `update-ready`.

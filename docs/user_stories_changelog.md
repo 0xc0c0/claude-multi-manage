@@ -4,6 +4,19 @@ Every change to [user_stories.md](user_stories.md), newest first. One dated
 section per change; each bullet names the story IDs it touches and what
 changed (added, status, criteria, delivery).
 
+## 2026-10-07
+
+- Added US-014 (restarts that survive Claude Code's own updates and
+  background work) from the 2026-10-07 reports that update + resume no
+  longer worked and that sessions showed `exited` almost daily. Root causes
+  recorded with the story: restarts landing while Claude Code's npm updater
+  had `claude` replaced by a placeholder, and background work (subagents,
+  background shells) that the screen does not show as busy. **In progress.**
+- US-008, US-011, US-013: criteria now defer to US-014 for background work
+  (never interrupted by `update`/`restart`/`maintain`, waited for by
+  `pause`), for the check that Claude Code is not mid-install, and for
+  retrying a failed restart on later maintenance passes.
+
 ## 2026-10-03
 
 - US-013: corrected after a stale manifest entry was reported on 2026-09-29.
