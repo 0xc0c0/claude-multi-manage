@@ -21,8 +21,9 @@
   (status and session id by pid; `busy` includes background work), falling back
   to `~/.claude/sessions/<pid>.json` while `claude` cannot run; an update in
   progress shows as `claude --version` failing or a fresh `~/.claude/.update.lock`
-  (npm installs leave a placeholder `claude` that exits 1), and nothing may be
-  stopped or started then
+  whose pid (its contents) is still running (npm installs leave a placeholder
+  `claude` that exits 1; a fresh lock from a pid that is gone was left behind
+  and is ignored), and nothing may be stopped or started then
 - a session's prompt is the `❯` line directly under the input box's top border,
   near the bottom of the screen: earlier prompts stay on screen as history and
   dialogs are drawn below them, so anchor on the border, never on the last `❯`;

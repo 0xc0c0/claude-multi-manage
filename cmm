@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 PROG="$(basename "${0}")"
 SESSION_PREFIX="claude-"
 MAINT_SESSION="cmm-maintain"
@@ -661,17 +661,49 @@ _restore_summary() {
 # binary not installed" and exits. A claude started then dies at once, so cmm
 # stops nothing, and starts nothing, unless a new claude can start right now.
 
-# True if no updater holds Claude Code's update lock (Claude Code itself takes
-# a lock older than five minutes to be stale) and 'claude --version' answers.
+# "~/.claude/x" for "$HOME/.claude/x".
+_tilde() { case "$1" in "$HOME"/*) printf '~%s\n' "${1#"$HOME"}" ;; *) printf '%s\n' "$1" ;; esac; }
+
+# True if no running updater holds Claude Code's update lock and
+# 'claude --version' answers. Claude Code writes its pid into the lock and
+# takes a lock older than five minutes to be stale, whatever became of that
+# process; a fresh lock whose process is gone was left behind by an updater
+# that has exited (every maintenance restart on 2026-10-18/19 waited out one,
+# five minutes each, before coming back fine), so it does not count here.
+# READY_WHY says what stands in the way, or which leftover lock was ignored;
+# READY_PID is the pid in that lock.
+READY_WHY=""; READY_PID=""
 _claude_ready() {
-  local f t
+  local f t args
+  READY_WHY=""; READY_PID=""
   for f in "$CLAUDE_DIR/.update.lock" "$CLAUDE_DIR/state/update-lock"; do
     [ -e "$f" ] || continue
     t=$(date -r "$f" +%s 2>/dev/null) || t=0
-    [ $(( $(date +%s) - t )) -ge 300 ] || return 1
+    [ $(( $(date +%s) - t )) -lt 300 ] || continue
+    READY_PID=$(tr -dc 0-9 < "$f" 2>/dev/null | cut -c1-10) || READY_PID=""
+    if [ -z "$READY_PID" ]; then
+      READY_WHY="an updater holds $(_tilde "$f")"; return 1
+    fi
+    args=$(ps -ww -o args= -p "$READY_PID" 2>/dev/null | head -n 1 | cut -c1-60) || args=""
+    if [ -n "$args" ]; then
+      READY_WHY="pid $READY_PID ($args) holds $(_tilde "$f")"; return 1
+    fi
+    READY_WHY="ignored $(_tilde "$f"), left by pid $READY_PID, which is gone"
   done
   case "$(claude --version 2>/dev/null)" in [0-9]*) return 0 ;; esac
+  READY_WHY="'claude --version' fails (claude is being installed)"
   return 1
+}
+
+# After _claude_ready: mention a leftover update lock that was ignored, and
+# whose it was if it belonged to the claude that just left pane $1.
+_say_ignored_lock() {
+  case "$READY_WHY" in ignored*) ;; *) return 0 ;; esac
+  if [ -n "$1" ] && [ "$READY_PID" = "$(_pane_fmt "$1" '#{pane_pid}')" ]; then
+    printf '%s (the claude that just exited)... ' "${READY_WHY%, which is gone}"
+  else
+    printf '%s... ' "$READY_WHY"
+  fi
 }
 
 # Wait up to $1 seconds for _claude_ready; false if it never was.
@@ -687,9 +719,9 @@ _claude_wait_ready() {
 # was not done) if a new claude still cannot start.
 _await_claude() {
   _claude_ready && return 0
-  printf 'Claude Code is being installed or updated; waiting up to %s for it...\n' "$(_secs_words "$INSTALL_WAIT")"
+  printf 'Claude Code is being installed or updated (%s); waiting up to %s for it...\n' "$READY_WHY" "$(_secs_words "$INSTALL_WAIT")"
   _claude_wait_ready "$INSTALL_WAIT" \
-    || die "a new claude still cannot start ('claude --version' fails, or an update holds Claude Code's lock); $1"
+    || die "a new claude still cannot start ($READY_WHY); $1"
 }
 
 # "5m" for 300 seconds, "45s" for 45.
@@ -922,7 +954,7 @@ _restart_session() {
     fi
     # Only stop a claude if a new one can start right now.
     if ! _claude_ready; then
-      warn "$name: Claude Code is being installed or updated, so a new claude could not start yet; left running, try again in a few minutes"
+      warn "$name: Claude Code is being installed or updated ($READY_WHY), so a new claude could not start yet; left running, try again in a few minutes"
       return 1
     fi
     id=$(_pane_claude_session "$pane")   # in case claude prints no resume hint
@@ -1009,21 +1041,22 @@ _bring_up() {
   if [ "$rc" != "off" ]; then cmd+=(--remote-control); base+=(--remote-control); fi
 
   if ! _claude_ready; then
-    printf 'waiting for Claude Code to finish updating... '
+    printf 'waiting for Claude Code to finish updating (%s)... ' "$READY_WHY"
     if ! _claude_wait_ready "$INSTALL_WAIT"; then
       printf 'failed\n'
-      warn "$name: a new claude still cannot start after $(_secs_words "$INSTALL_WAIT") ('claude --version' fails, or an update holds Claude Code's lock)"
+      warn "$name: a new claude still cannot start after $(_secs_words "$INSTALL_WAIT") ($READY_WHY)"
       _bring_up_failed "$name" "$which" "$wt" "$rc" "$model" "$effort" "$path"
       return 1
     fi
   fi
+  _say_ignored_lock "$pane"
 
   if _respawn_claude "$name" "$pane" "$path" "${cmd[@]}"; then
     up=1
   else
     why=$(_pane_last_words "$pane")
     if ! _claude_ready; then
-      warn "$name: claude exited right after starting ($why); Claude Code is being updated, waiting for it"
+      warn "$name: claude exited right after starting ($why); Claude Code is being updated ($READY_WHY), waiting for it"
       if _claude_wait_ready "$INSTALL_WAIT" && _respawn_claude "$name" "$pane" "$path" "${cmd[@]}"; then
         up=1
       else
@@ -1224,8 +1257,10 @@ version is installed ('$PROG restart' or --restart-only skips that step).
 
 While Claude Code installs an update, the 'claude' command is missing or a
 placeholder that cannot start, so $PROG first makes sure a new claude can
-start ('claude --version' answers, no updater holds Claude Code's update
-lock), waiting up to 5 minutes for that before giving up without touching
+start: 'claude --version' answers and no running updater holds Claude Code's
+update lock (the lock holds the updater's pid; one left behind by a process
+that has exited is ignored, and said so). $PROG waits up to 5 minutes for
+that, saying what it is waiting for, before giving up without touching
 anything. If the restarted claude still dies at once, $PROG shows what it
 printed, waits for an install that started meanwhile and tries again, then
 tries without the restored model and effort. A session that does not come
@@ -1691,7 +1726,7 @@ _maintain_pass() {
   # Code installs an update (see _claude_ready).
   if ! _claude_ready; then
     ready=0
-    log "Claude Code is being installed or updated, so a new claude cannot start yet; no restarts this pass"
+    log "Claude Code is being installed or updated ($READY_WHY), so a new claude cannot start yet; no restarts this pass"
   fi
 
   while IFS='|' read -r name _rest; do

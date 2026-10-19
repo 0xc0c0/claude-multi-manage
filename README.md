@@ -67,9 +67,13 @@ While Claude Code installs an update (with an npm install), the `claude`
 command is missing or a placeholder that only prints `Error: claude native
 binary not installed.`, so a Claude started then dies at once. `cmm` therefore
 stops nothing until a new Claude can start: `claude --version` has to answer
-and no updater may hold Claude Code's update lock. `cmm update`, `restart`,
-`new` and `reload` wait up to five minutes for that (`CMM_INSTALL_WAIT`
-seconds), and a maintenance pass leaves its restarts for the next pass.
+and no running updater may hold Claude Code's update lock. The lock holds the
+updater's pid, so a fresh lock whose process is gone was left behind: `cmm`
+ignores it (and says so) rather than waiting the five minutes after which
+Claude Code itself would reuse it. `cmm update`, `restart`, `new` and
+`reload` wait up to five minutes for a startable Claude (`CMM_INSTALL_WAIT`
+seconds), saying what they are waiting for, and a maintenance pass leaves
+its restarts for the next pass.
 
 If a restarted Claude dies anyway, `cmm` shows what it printed, waits for an
 install that started meanwhile, tries again, and then tries once more without
