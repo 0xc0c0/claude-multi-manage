@@ -4,6 +4,20 @@ Every change to [user_stories.md](user_stories.md), newest first. One dated
 section per change; each bullet names the story IDs it touches and what
 changed (added, status, criteria, delivery).
 
+## 2026-10-19
+
+- US-014: corrected after a look at the maintenance log on 2026-10-19 (while
+  getting caught up on the outstanding work). Every automatic restart on
+  2026-10-18 and 2026-10-19, and most of those in the week before, had
+  waited the full five minutes at "waiting for Claude Code to finish
+  updating" although `claude` could start the whole time: cmm, like Claude
+  Code, took a fresh update lock as an update in progress until it was five
+  minutes old, whatever had become of the process that wrote it. A fresh
+  lock whose pid is gone now counts as left behind and is ignored (and said
+  so), and cmm says what it is waiting for (which process holds the lock, or
+  that `claude --version` fails) so the next such wait can be traced.
+  **In progress**.
+
 ## 2026-10-07
 
 - Added US-014 (restarts that survive Claude Code's own updates and

@@ -73,13 +73,25 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
   - The agents list is drawn below the footer, so reading "the last 10
     lines" as the footer can miss `esc to interrupt`, the update notice and
     the Remote Control state.
+  - Seen after the fix, by 2026-10-19: every maintenance restart on
+    2026-10-18 and 2026-10-19, and most of those in the week before, spent
+    exactly five minutes at "waiting for Claude Code to finish updating" and
+    then came back fine. cmm, like Claude Code, took a fresh update lock as
+    an update in progress until it was five minutes old; an updater still
+    installing releases the lock within seconds, so those locks were no
+    longer protecting an install. The lock holds the updater's pid, which
+    tells a running updater from one that is gone.
 - **Acceptance criteria:**
   - Nothing is stopped while Claude Code is being installed or updated.
     Before stopping a session, cmm checks that `claude --version` answers and
-    that no updater holds Claude Code's update lock (which Claude Code treats
-    as stale after five minutes). `cmm update`/`restart` wait up to five
-    minutes for that and give up without touching a session; a maintenance
-    pass leaves its restarts for the next pass.
+    that no running updater holds Claude Code's update lock: the lock holds
+    the updater's pid, and a fresh lock whose process is gone was left
+    behind, so cmm ignores it (and says so) instead of waiting the five
+    minutes after which Claude Code itself would reuse it. When cmm does
+    wait, its message and log say what for (which process holds the lock, or
+    that `claude --version` fails). `cmm update`/`restart` wait up to five
+    minutes and give up without touching a session; a maintenance pass
+    leaves its restarts for the next pass.
   - If the new Claude still dies at once, cmm reports and logs what it
     printed, waits for an install that started meanwhile and tries again,
     and then retries without the restored model and effort as before. A
