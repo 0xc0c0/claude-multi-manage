@@ -114,7 +114,7 @@ change to this file is logged in [user_stories_changelog.md](user_stories_change
   - cmm asks Claude Code (`claude agents --json`) which conversation a
     running session is in, and uses that when Claude prints no resume hint.
 - **Status:** Done
-- **Delivered in:** fcaeae7
+- **Delivered in:** fcaeae7; the leftover-lock correction in c745ef6
 
 ### US-013 — Pause every session before a reboot and bring them back afterwards
 

@@ -16,7 +16,7 @@ changed (added, status, criteria, delivery).
   lock whose pid is gone now counts as left behind and is ignored (and said
   so), and cmm says what it is waiting for (which process holds the lock, or
   that `claude --version` fails) so the next such wait can be traced.
-  **In progress**.
+  **Done** in c745ef6.
 
 ## 2026-10-07
 
